@@ -261,4 +261,19 @@ affiliated with or endorsed by TVP.
 
 ## License
 
-MIT
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
+
+The Docker image also contains [FFmpeg](https://ffmpeg.org) from Alpine Linux,
+licensed under GPL-2.0-or-later. It runs as a separate program and is not
+linked into the proxy. Its source is available from
+[Alpine's aports](https://gitlab.alpinelinux.org/alpine/aports/-/tree/master/community/ffmpeg).
