@@ -1,0 +1,7 @@
+#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="mp4a",DEFAULT="NO",NAME="pl-x-aux-mp4a",LANGUAGE="pl-x-aux",URI="https://cdn.example/live/playlist.m3u8?audioId=5&lang=pl-x-aux"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="mp4a",DEFAULT="YES",NAME="pol-mp4a",LANGUAGE="pol",URI="https://cdn.example/live/playlist.m3u8?audioId=1&lang=pol"
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,AUDIO="mp4a"
+https://cdn.example/live/playlist.m3u8?videoId=1

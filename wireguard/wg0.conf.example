@@ -1,0 +1,20 @@
+# Copy to wireguard/wg_confs/wg0.conf and fill in. chmod 600.
+# Generate a keypair:   wg genkey | tee privatekey | wg pubkey > publickey
+# Add publickey as a peer on your WireGuard server in Poland.
+
+[Interface]
+PrivateKey = <client private key>
+Address = 10.99.0.2/32                   # address assigned to this peer on your server
+DNS = 1.1.1.1                            # or a resolver reachable from the tunnel/LAN
+
+# Keep private ranges (LAN clients, Docker, DNS on the LAN) off the tunnel so
+# replies to your media server don't go to Poland. 172.29.99.1 is the gateway
+# of the compose network defined in docker-compose.yml.
+PostUp = for n in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do ip route add $n via 172.29.99.1 dev eth0; done
+
+[Peer]
+PublicKey = <server public key>
+# PresharedKey = <optional preshared key>
+Endpoint = vpn.example.org:51820         # your WireGuard server located in Poland
+AllowedIPs = 0.0.0.0/0                   # applies only inside this stack
+PersistentKeepalive = 25

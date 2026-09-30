@@ -1,0 +1,48 @@
+# TVP live channels for Jellyfin (or any IPTV client) via a Polish WireGuard exit.
+#
+# The WireGuard tunnel exists only inside this stack's network namespace.
+# Host routing and other containers are unaffected.
+#
+# M3U entry per channel: http://<docker-host>:38099/tvp/<TVP live id>.ts
+# Generate the whole list with:
+#   docker exec tvp-pl-proxy tvp-vod-proxy make-m3u <docker-host>:38099 > tvp.m3u
+services:
+  wg:
+    image: lscr.io/linuxserver/wireguard:latest
+    container_name: tvp-pl-wg
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.conf.all.src_valid_mark: "1"
+    environment:
+      TZ: Europe/Warsaw
+    volumes:
+      - ./wireguard:/config          # wg_confs/wg0.conf, see wireguard/wg0.conf.example
+    ports:
+      - "38099:8080"                 # proxy listens in this namespace
+    networks: [tvp-pl]
+    healthcheck:
+      # the whole point: traffic must leave from Poland
+      test: ["CMD-SHELL", "curl -sf -m 10 https://ipinfo.io/country | grep -qx PL"]
+      interval: 5m
+      timeout: 15s
+      start_period: 30s
+    restart: unless-stopped
+
+  proxy:
+    image: ghcr.io/mkowalski/tvp-vod-proxy-rs:latest
+    container_name: tvp-pl-proxy
+    # environment:
+    #   MAX_BITRATE: "4000000"       # cap the variant bitrate (bit/s); default 0 = no limit
+    network_mode: service:wg         # all proxy traffic goes through the tunnel
+    depends_on:
+      wg:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  tvp-pl:
+    ipam:
+      config:
+        # must match the gateway used in wg0.conf PostUp
+        - subnet: 172.29.99.0/24
+          gateway: 172.29.99.1

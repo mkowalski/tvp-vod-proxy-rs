@@ -1,0 +1,16 @@
+#EXTM3U
+#EXT-X-VERSION:5
+## Created with Broadpeak BkS350 Origin Packager (version=1.15.20-32599)
+
+# AUDIO groups
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-aacl-211",LANGUAGE="pol",NAME="Polski",AUTOSELECT=YES,CHANNELS="2",URI="TVP_Historia_2-audio_pol=211000.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-aacl-211",LANGUAGE="pol",NAME="Audiodeskrypcja",AUTOSELECT=NO,CHANNELS="2",URI="TVP_Historia_2-audio_ad=211000.m3u8"
+
+# SUBTITLES groups
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="textstream",LANGUAGE="pl",NAME="polskie",DEFAULT=NO,AUTOSELECT=NO,URI="TVP_Historia_2-textstream_567017474_pol=8000.m3u8"
+
+# variants
+#EXT-X-STREAM-INF:BANDWIDTH=998000,CODECS="mp4a.40.2,avc1.4D401E",RESOLUTION=512x288,FRAME-RATE=50,AUDIO="audio-aacl-211",SUBTITLES="textstream"
+TVP_Historia_2-audio_pol=211000-video=750000.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=7680000,CODECS="mp4a.40.2,avc1.640028",RESOLUTION=1920x1080,FRAME-RATE=50,AUDIO="audio-aacl-211",SUBTITLES="textstream"
+TVP_Historia_2-audio_pol=211000-video=7200000.m3u8
