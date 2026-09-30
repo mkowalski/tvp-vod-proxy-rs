@@ -29,7 +29,11 @@ services:
     restart: unless-stopped
 
   proxy:
-    image: ghcr.io/mkowalski/tvp-vod-proxy-rs:latest
+    # Pin a version: updating the image restarts the proxy, which cuts any
+    # recording in progress. Bump it by hand when nothing is recording.
+    image: ghcr.io/mkowalski/tvp-vod-proxy-rs:0.0.1
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"   # opt out of auto-updates
     container_name: tvp-pl-proxy
     # environment:
     #   MAX_BITRATE: "4000000"       # cap the variant bitrate (bit/s); default 0 = no limit

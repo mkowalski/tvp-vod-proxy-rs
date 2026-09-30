@@ -102,6 +102,11 @@ curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 http://localhost:38099/tv
 Images are published for `linux/amd64` and `linux/arm64` as
 `ghcr.io/mkowalski/tvp-vod-proxy-rs:<version>` and `:latest`.
 
+**Pin a version rather than `:latest`.** Restarting the proxy cuts every
+stream going through it, including DVR recordings in progress, and Jellyfin
+does not reconnect. The sample compose pins a version and opts out of
+Watchtower; update by changing the tag when nothing is recording.
+
 ### Generate the channel list
 
 ```sh
