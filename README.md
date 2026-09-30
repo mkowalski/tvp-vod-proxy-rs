@@ -178,11 +178,86 @@ push and pull request. Pushing a `v*` tag publishes a multi-arch image to GHCR.
   all of it goes through your Polish uplink (~7 Mbit/s per 1080p channel).
 - TVP may change its API at any time.
 
-## Disclaimer
+## Legal notice
 
-This project only relays streams TVP provides free of charge to viewers in
-Poland, through a connection in Poland that you operate. Make sure your use
-complies with TVP's terms and the law where you live.
+This section explains how the project relates to Polish law. It is a summary
+of the statutes linked below, not legal advice. You are responsible for how you
+use the software.
+
+### What the software does
+
+- It plays **free-to-air** live channels that Telewizja Polska S.A. makes
+  available to everyone on vod.tvp.pl without an account or payment.
+- It connects to TVP **from a Polish internet connection that you operate**
+  (your own WireGuard server in Poland). It does not use third-party mirrors or
+  unofficial restreams; every stream comes directly from TVP's servers.
+- It is for **private viewing and recording** by you and your household. The
+  proxy serves your own media server; it is not a public service and must not be
+  exposed to the internet.
+
+### What it does not do
+
+- **No DRM circumvention.** Channels protected by encryption (e.g. FairPlay)
+  are detected and refused with HTTP 415. The software never decrypts, removes
+  or alters any protection.
+- **No paid content.** Channels that require a TVP subscription are skipped.
+- **No redistribution.** It does not rebroadcast (*reemitowanie*) or make any
+  programme available to the public.
+- **No modification** of the programme: video and audio are copied bit-for-bit
+  (`ffmpeg -c copy`) into a different container.
+
+### Relevant provisions
+
+**Personal use** — [Art. 23 Copyright Act][art23] (*ustawa o prawie autorskim i
+prawach pokrewnych*): a work that has already been disseminated may be used free
+of charge, without the author's permission, for one's own personal use,
+including by people in a personal relationship (family, friends). TVP's free
+live channels are disseminated works.
+[Art. 100][art100] applies the same permitted use to related rights, which
+covers the broadcaster's own right in its broadcasts ([Art. 97][art97]).
+Permitted use must not interfere with the normal exploitation of the work or
+harm the rightholder's legitimate interests ([Art. 35][art35]); private viewing
+of a free channel, from TVP's own servers, does not deprive TVP of any
+revenue.
+
+**Technical protection measures** — [Art. 6 ust. 1 pkt 11][art6] defines
+*effective* technical protection as control over use of a work through an
+access code or protection mechanism, **in particular encryption, scrambling or
+other transformation of the work, or a copy-control mechanism**. Liability under
+[Art. 79 ust. 6][art79] and [Art. 118¹][art1181] concerns removing or
+circumventing such measures. This software does not break encryption,
+scrambling or copy control, and refuses encrypted channels.
+
+**Access to information** — [Art. 267 Criminal Code][art267] penalises obtaining
+*information not intended for the person* by breaking or bypassing a special
+safeguard. The free channels are intended for the public, and the software
+reaches them through an ordinary connection that genuinely originates in
+Poland; it does not break into any system or bypass authentication.
+
+**Rebroadcasting** — rebroadcasting a programme to the public
+(*reemitowanie*, [Art. 6 ust. 1 pkt 5][art6]) is the broadcaster's exclusive
+right ([Art. 97 pkt 4][art97]). This software only delivers a stream to the
+person who requested it, on their own network; it is not a rebroadcast.
+
+### Your responsibilities
+
+- Use it only for private viewing within your household.
+- Keep the proxy on your private network; do not publish it, share its URLs or
+  run it as a service for others.
+- Do not sell, publicly show or upload recordings.
+- If you live outside Poland, local law also applies to you.
+
+TVP and vod.tvp.pl are trademarks of Telewizja Polska S.A. This project is not
+affiliated with or endorsed by TVP.
+
+[art6]: https://lexlege.pl/ustawa-o-prawie-autorskim-i-prawach-pokrewnych/art-6/
+[art23]: https://lexlege.pl/ustawa-o-prawie-autorskim-i-prawach-pokrewnych/art-23/
+[art35]: https://lexlege.pl/ustawa-o-prawie-autorskim-i-prawach-pokrewnych/art-35/
+[art79]: https://lexlege.pl/ustawa-o-prawie-autorskim-i-prawach-pokrewnych/art-79/
+[art97]: https://lexlege.pl/ustawa-o-prawie-autorskim-i-prawach-pokrewnych/art-97/
+[art100]: https://lexlege.pl/ustawa-o-prawie-autorskim-i-prawach-pokrewnych/art-100/
+[art1181]: https://lexlege.pl/ustawa-o-prawie-autorskim-i-prawach-pokrewnych/art-118-1/
+[art267]: https://lexlege.pl/kk/art-267/
 
 ## License
 
