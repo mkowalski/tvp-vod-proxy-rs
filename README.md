@@ -57,7 +57,9 @@ Per request for `/tvp/<id>.ts`:
    sync).
 4. If ffmpeg stops (e.g. the signed token expires), the proxy resolves a fresh
    URL and continues on the same HTTP response, so long recordings survive
-   token rotation. When the client disconnects, ffmpeg is killed.
+   token rotation. ffmpeg gives up on upstream reads that stall for 15 s
+   rather than hanging. When the client disconnects, ffmpeg is killed, even
+   if it is stalled.
 
 No transcoding happens in the proxy; CPU use is negligible.
 
@@ -165,7 +167,8 @@ The integration tests generate a small TVP-like HLS stream (two fMP4 video
 variants and a separate audio rendition) with ffmpeg, serve it from a mock
 TVP API/CDN, and check the proxy's output: one video + one audio track,
 variant selection, DRM → 415, API errors → 502, and that ffmpeg is stopped
-when the client disconnects. No test talks to the real TVP.
+(and not restarted) when the client disconnects, even while ffmpeg is stalled.
+No test talks to the real TVP.
 
 CI runs formatting, clippy, tests, `cargo-deny` and a Docker build on every
 push and pull request. Pushing a `v*` tag publishes a multi-arch image to GHCR.
