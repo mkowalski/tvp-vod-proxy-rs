@@ -49,7 +49,8 @@ Per request for `/tvp/<id>.ts`:
 1. The proxy asks TVP's API for the channel's current HLS URL (works only from
    a Polish IP, hence the tunnel).
 2. It reads the master playlist and selects the highest video variant (or the
-   highest under `MAX_BITRATE`, if set), plus the default audio rendition.
+   highest under `MAX_BITRATE`, if set; if every variant is above it, the
+   lowest one), plus the default audio rendition.
    DRM-protected channels are rejected with HTTP 415.
 3. It writes a one-variant master playlist and runs `ffmpeg -c copy` on it,
    streaming MPEG-TS to the client. Reading video and audio as **one** HLS
@@ -116,7 +117,8 @@ docker exec tvp-pl-proxy tvp-vod-proxy make-m3u 192.0.2.10:38099 > tvp.m3u
 ```
 
 Replace `192.0.2.10` with the address your IPTV client uses to reach the
-Docker host. Paid and DRM-protected channels are skipped. Channel IDs come from
+Docker host. Paid channels and any channel that fails to resolve (DRM, no HLS
+source, upstream error) are skipped and logged to stderr. Channel IDs come from
 `https://vod.tvp.pl/api/products/lives` (e.g. TVP Kultura = `399700`).
 
 ### Jellyfin
@@ -135,11 +137,15 @@ NVENC, …) this is cheap.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MAX_BITRATE` | `0` (no limit) | Highest average variant bitrate to select, bit/s. `0` → always the top variant (1080p50, ~6.8 Mbit/s today); `4000000` → 576p. |
+| `MAX_BITRATE` | `0` (no limit) | Highest average variant bitrate to select, bit/s. `0` → always the top variant (1080p50, ~6.8 Mbit/s today); `4000000` → 576p. If no variant fits, the lowest is used. |
 | `PORT` | `8080` | Listen port inside the container. |
 | `FFMPEG` | `ffmpeg` | ffmpeg binary. |
-| `TVP_API` | `https://vod.tvp.pl` | API base URL. |
+| `TVP_API` | `https://vod.tvp.pl` | API base URL (a path prefix is kept). |
 | `RUST_LOG` | `info` | Log filter, e.g. `debug`. |
+
+`GET /healthz` returns `ok` while the proxy is running; the image's
+`HEALTHCHECK` uses it. The sample compose file additionally checks that TVP is
+reachable through the tunnel.
 
 Live HLS arrives in real time, so the selected variant's average bitrate must
 fit in the sustained throughput from Poland. If playback stutters, set
@@ -157,9 +163,9 @@ fit in the sustained throughput from Poland. If playback stutters, set
 ## Development
 
 ```sh
-cargo test                        # unit + integration tests (need ffmpeg/ffprobe on PATH)
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+cargo test --locked               # unit + integration tests (streaming ones need ffmpeg/ffprobe on PATH)
+cargo clippy --all-targets --locked -- -D warnings
+cargo fmt --all --check
 cargo run -- serve                # needs a Polish IP to reach TVP
 ```
 
@@ -173,8 +179,8 @@ re-resolves the URL (keeping the old one if that fails), three quick failures
 in a row end the stream, and a long run resets the count.
 No test talks to the real TVP.
 
-CI runs formatting, clippy, tests, `cargo-deny` and a Docker build on every
-push and pull request. Pushing a `v*` tag publishes a multi-arch image to GHCR.
+CI runs formatting, clippy, tests, `cargo-deny` and a Docker build on pull
+requests and pushes to `main`. Pushing a `v*` tag publishes a multi-arch image to GHCR.
 
 ## Limitations
 

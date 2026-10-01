@@ -22,14 +22,21 @@ struct Variant {
 }
 
 /// Value of `KEY=` in an `#EXT-X-...:` attribute list. Handles quoted values.
+/// Malformed tokens (no `=`, unterminated quote) are skipped rather than
+/// invalidating the whole line.
 fn attr(line: &str, key: &str) -> Option<String> {
     let body = line.split_once(':')?.1;
     let mut rest = body;
     while !rest.is_empty() {
         let (name, after) = rest.split_once('=')?;
+        // tokens without '=' before this one end up in `name`: drop them
+        let name = name.rsplit_once(',').map_or(name, |(_, n)| n);
         let (value, next) = if let Some(quoted) = after.strip_prefix('"') {
-            let end = quoted.find('"')?;
-            (&quoted[..end], quoted[end + 1..].trim_start_matches(','))
+            match quoted.find('"') {
+                Some(end) => (&quoted[..end], quoted[end + 1..].trim_start_matches(',')),
+                // unterminated quote: treat it as a plain value
+                None => quoted.split_once(',').unwrap_or((quoted, "")),
+            }
         } else {
             match after.split_once(',') {
                 Some((v, n)) => (v, n),
@@ -244,5 +251,40 @@ mod tests {
         assert_eq!(attr(l, "CODECS").as_deref(), Some("a,b"));
         assert_eq!(attr(l, "AUDIO").as_deref(), Some("g"));
         assert_eq!(attr(l, "MISSING"), None);
+    }
+
+    #[test]
+    fn attr_skips_malformed_tokens() {
+        let l = r#"#EXT-X-STREAM-INF:JUNK,BANDWIDTH=10,AUDIO="g"#;
+        assert_eq!(attr(l, "BANDWIDTH").as_deref(), Some("10"));
+        assert_eq!(attr(l, "AUDIO").as_deref(), Some("g"));
+        let l = r#"#EXT-X-STREAM-INF:CODECS="a"junk,BANDWIDTH=5"#;
+        assert_eq!(attr(l, "BANDWIDTH").as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn malformed_attribute_does_not_drop_variant() {
+        let m = "#EXTM3U\n#EXT-X-STREAM-INF:ODD,BANDWIDTH=1000,RESOLUTION=1x1\nv.m3u8\n";
+        let s = select(m, &base(), 0).unwrap();
+        assert_eq!(s.bitrate, 1000);
+        assert!(s.video.as_str().ends_with("/v.m3u8"));
+    }
+
+    #[test]
+    fn cap_is_inclusive() {
+        let s = select(TVP, &base(), 2_741_200).unwrap();
+        assert_eq!(s.bitrate, 2_741_200);
+        let s = select(TVP, &base(), 2_741_199).unwrap();
+        assert_eq!(s.bitrate, 761_200);
+    }
+
+    #[test]
+    fn muxed_audio_has_no_separate_rendition() {
+        let m = "#EXTM3U\n\
+                 #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"pl\",DEFAULT=YES\n\
+                 #EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"a\"\n\
+                 v.m3u8\n";
+        let s = select(m, &base(), 0).unwrap();
+        assert_eq!(s.audio, None);
     }
 }

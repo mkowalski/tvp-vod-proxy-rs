@@ -21,16 +21,21 @@ use tokio_stream_shim::ReceiverStream;
 /// Give up after this many consecutive quick failures.
 const MAX_QUICK_FAILURES: u32 = 3;
 
+/// Shared configuration for all streams.
 #[derive(Clone)]
 pub struct AppState {
     pub client: Client,
+    /// ffmpeg binary.
     pub ffmpeg: PathBuf,
+    /// Directory for the per-stream master playlists given to ffmpeg.
     pub work_dir: PathBuf,
+    /// Pause before re-resolving after ffmpeg exits.
     pub retry_delay: Duration,
     /// ffmpeg runs shorter than this count as a quick failure.
     pub quick_failure: Duration,
 }
 
+/// Routes: `GET /tvp/<id>.ts` and `GET /healthz`.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/tvp/{file}", get(stream))
@@ -49,17 +54,14 @@ async fn stream(State(state): State<Arc<AppState>>, Path(file): Path<String>) ->
     // resolve once up front so errors become proper HTTP status codes
     let selection = match state.client.resolve(channel).await {
         Ok(sel) => sel,
-        Err(ResolveError::Drm) => {
+        Err(e @ ResolveError::Drm) => {
             tracing::warn!(channel, "DRM-protected, not supported");
-            return (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "DRM-protected channel\n",
-            )
-                .into_response();
+            return (StatusCode::UNSUPPORTED_MEDIA_TYPE, format!("{e}\n")).into_response();
         }
         Err(e) => {
+            // the error may contain the signed CDN URL: log it, don't return it
             tracing::error!(channel, error = %e, "resolve failed");
-            return (StatusCode::BAD_GATEWAY, format!("{e}\n")).into_response();
+            return (StatusCode::BAD_GATEWAY, "upstream error\n").into_response();
         }
     };
     tracing::info!(channel, bitrate = selection.bitrate, "stream started");

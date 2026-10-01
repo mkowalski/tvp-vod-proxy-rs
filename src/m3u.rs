@@ -6,19 +6,32 @@ use crate::tvp::LiveItem;
 pub fn logo(item: &LiveItem) -> Option<String> {
     ["logo", "16x9"].iter().find_map(|k| {
         let url = item.images.get(*k)?.get(0)?.get("url")?.as_str()?;
+        let url = url
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .replace('"', "%22");
         Some(if url.starts_with("//") {
             format!("https:{url}")
         } else {
-            url.to_string()
+            url
         })
     })
+}
+
+/// Channel title safe for an `#EXTINF` line: commas and control characters
+/// (which would split the entry or the line) become spaces.
+fn title(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c == ',' || c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// One `#EXTINF` + URL pair per playable channel, pointing at the proxy.
 pub fn render<'a>(host: &str, items: impl IntoIterator<Item = &'a LiveItem>) -> String {
     let mut out = String::from("#EXTM3U\n");
     for item in items {
-        let title = item.title.replace(',', " ");
+        let title = title(&item.title);
         let logo = logo(item)
             .map(|l| format!(" tvg-logo=\"{l}\""))
             .unwrap_or_default();
@@ -69,6 +82,19 @@ mod tests {
     fn commas_in_title_do_not_break_extinf() {
         let m = render("h:1", &[item(1, "A, B", json!(null))]);
         assert!(m.contains(",A  B\n"));
+    }
+
+    #[test]
+    fn control_characters_do_not_break_playlist() {
+        let i = item(
+            1,
+            "A\r\nhttp://evil/\tB",
+            json!({"logo": [{"url": "https://a/x\".png\n"}]}),
+        );
+        let m = render("h:1", &[i]);
+        assert_eq!(m.lines().count(), 3, "{m}");
+        assert!(m.contains(",A  http://evil/ B\n"), "{m}");
+        assert!(m.contains("tvg-logo=\"https://a/x%22.png\""), "{m}");
     }
 
     #[test]
