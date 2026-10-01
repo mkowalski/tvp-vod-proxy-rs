@@ -65,7 +65,10 @@ async fn stream(State(state): State<Arc<AppState>>, Path(file): Path<String>) ->
     tracing::info!(channel, bitrate = selection.bitrate, "stream started");
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
-    tokio::spawn(pump(state, channel, selection, tx));
+    tokio::spawn(async move {
+        pump(state, channel, selection, tx).await;
+        tracing::info!(channel, "stream ended");
+    });
 
     Response::builder()
         .header(header::CONTENT_TYPE, "video/mp2t")
@@ -81,9 +84,20 @@ async fn pump(
     mut selection: hls::Selection,
     tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) {
-    let master = state
-        .work_dir
-        .join(format!("tvp-{channel}-{}.m3u8", std::process::id()));
+    // Private to this stream, so concurrent streams of one channel never
+    // rewrite or delete the playlist another one's ffmpeg is reading. Random
+    // name, created with O_EXCL and mode 0600; removed when `master` drops.
+    let master = match tempfile::Builder::new()
+        .prefix(&format!("tvp-{channel}-{}-", std::process::id()))
+        .suffix(".m3u8")
+        .tempfile_in(&state.work_dir)
+    {
+        Ok(file) => file.into_temp_path(),
+        Err(e) => {
+            tracing::error!(channel, error = %e, "cannot create master playlist");
+            return;
+        }
+    };
     let mut failures = 0;
     loop {
         if let Err(e) = tokio::fs::write(&master, hls::single_variant_master(&selection)).await {
@@ -121,8 +135,6 @@ async fn pump(
             Err(e) => tracing::warn!(channel, error = %e, "re-resolve failed, retrying old URL"),
         }
     }
-    let _ = tokio::fs::remove_file(&master).await;
-    tracing::info!(channel, "stream ended");
 }
 
 /// Returns Ok(true) if the client disconnected, Ok(false) if ffmpeg exited.

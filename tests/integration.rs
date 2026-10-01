@@ -413,3 +413,67 @@ async fn client_disconnect_during_retry_does_not_restart_ffmpeg() {
         .count();
     assert_eq!(resolves, 1, "re-resolved for nobody");
 }
+
+/// The first line of a stream, where a stub ffmpeg printed its `-i` path.
+async fn stub_master_path(resp: &mut reqwest::Response) -> PathBuf {
+    assert_eq!(resp.status(), 200);
+    let mut buf = Vec::new();
+    while !buf.contains(&b'\n') {
+        let chunk = tokio::time::timeout(Duration::from_secs(10), resp.chunk())
+            .await
+            .expect("stub ffmpeg output")
+            .unwrap()
+            .expect("stream ended early");
+        buf.extend_from_slice(&chunk);
+    }
+    let line = buf.split(|&b| b == b'\n').next().unwrap();
+    PathBuf::from(String::from_utf8(line.to_vec()).unwrap())
+}
+
+async fn wait_removed(p: &Path) {
+    for _ in 0..50 {
+        if !p.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{p:?} still exists 5s after its client disconnected");
+}
+
+#[tokio::test]
+async fn concurrent_streams_of_a_channel_use_separate_playlists() {
+    use std::os::unix::fs::PermissionsExt;
+    // Prints the master playlist path it was given, then stays up.
+    let dir = tempfile::tempdir().unwrap();
+    let ffmpeg = stub_ffmpeg(
+        dir.path(),
+        r#"for a; do [ "$prev" = -i ] && echo "$a"; prev=$a; done; exec sleep 1000"#,
+    );
+    let mock = MockServer::start().await;
+    mock_channel(&mock, 12).await;
+    let addr = start_proxy_with(&mock.uri(), 0, ffmpeg, Duration::from_millis(10)).await;
+    let url = format!("http://{addr}/tvp/12.ts");
+
+    let mut a = reqwest::get(&url).await.unwrap();
+    let master_a = stub_master_path(&mut a).await;
+    let mut b = reqwest::get(&url).await.unwrap();
+    let master_b = stub_master_path(&mut b).await;
+    assert_ne!(master_a, master_b, "streams share a master playlist");
+    for m in [&master_a, &master_b] {
+        assert!(
+            m.starts_with(std::env::temp_dir()),
+            "{m:?} outside work_dir"
+        );
+        // it holds signed CDN URLs: not readable by other users
+        let mode = std::fs::metadata(m).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{m:?}");
+    }
+
+    // A ending removes its own playlist, not the one B's ffmpeg is reading
+    drop(a);
+    wait_removed(&master_a).await;
+    assert!(master_b.exists(), "B's playlist removed when A ended");
+
+    drop(b);
+    wait_removed(&master_b).await;
+}
