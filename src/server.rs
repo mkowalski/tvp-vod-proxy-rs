@@ -130,6 +130,9 @@ async fn pump(
         () = state.shutdown.cancelled() => Err("server shutting down"),
     };
     if let Err(reason) = result {
+        // hyper discards response data it has not written out yet when the
+        // body fails, so let it take everything sent so far first
+        let _ = tx.reserve_many(tx.max_capacity()).await;
         let _ = tx.send(Err(std::io::Error::other(reason))).await;
     }
     tracing::info!(channel, "stream ended");
