@@ -105,10 +105,11 @@ docker compose ps          # tvp-pl-wg must become "healthy" (exit country = PL)
 curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 http://localhost:38099/tvp/399700.ts
 ```
 
-The sample compose publishes the proxy on `127.0.0.1:38099` only. If Jellyfin
-runs on another machine or in another container, replace `127.0.0.1` in
-`docker-compose.yml` with the Docker host's LAN address (e.g.
-`"192.0.2.10:38099:8080"`). Never publish the proxy on a public interface.
+The sample compose publishes the proxy on all of the Docker host's interfaces,
+so Jellyfin on another machine or in another container can reach it.
+Restricting it to the host's LAN address in `docker-compose.yml` (e.g.
+`"192.0.2.10:38099:8080"`) is recommended. Never publish the proxy on a public
+interface.
 
 Images are published for `linux/amd64` and `linux/arm64` as
 `ghcr.io/mkowalski/tvp-vod-proxy-rs:<version>` and `:latest`.

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempPath;
 use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream_shim::ReceiverStream;
@@ -37,10 +38,33 @@ pub struct AppState {
     pub retry_delay: Duration,
     /// ffmpeg runs shorter than this count as a quick failure.
     pub quick_failure: Duration,
-    /// One permit per running stream; requests that find none get 503.
+    /// One permit per running stream, taken once its channel has resolved;
+    /// requests that find none get 503.
     pub streams: Arc<Semaphore>,
     /// Cancel to end all running streams (on server shutdown).
     pub shutdown: CancellationToken,
+    /// After `shutdown`, how long [`serve`] waits for responses to finish.
+    pub shutdown_grace: Duration,
+}
+
+/// Serve until `state.shutdown` is cancelled, then give running responses up
+/// to `state.shutdown_grace` to finish: a client that stopped reading would
+/// otherwise keep its response, and with it the server, alive forever.
+pub async fn serve(listener: TcpListener, state: AppState) -> std::io::Result<()> {
+    let shutdown = state.shutdown.clone();
+    let grace = state.shutdown_grace;
+    let server = axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned());
+    tokio::select! {
+        r = server => r,
+        () = async {
+            shutdown.cancelled().await;
+            tokio::time::sleep(grace).await;
+        } => {
+            tracing::warn!("streams did not end in time, exiting");
+            Ok(())
+        }
+    }
 }
 
 /// Routes: `GET /tvp/<id>.ts` and `GET /healthz`.
@@ -59,10 +83,6 @@ async fn stream(State(state): State<Arc<AppState>>, Path(file): Path<String>) ->
     let Some(channel) = channel_id(&file) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(permit) = state.streams.clone().try_acquire_owned() else {
-        tracing::warn!(channel, "too many streams");
-        return (StatusCode::SERVICE_UNAVAILABLE, "too many streams\n").into_response();
-    };
     // resolve once up front so errors become proper HTTP status codes
     let selection = match state.client.resolve(channel).await {
         Ok(sel) => sel,
@@ -76,10 +96,15 @@ async fn stream(State(state): State<Arc<AppState>>, Path(file): Path<String>) ->
             return (StatusCode::BAD_GATEWAY, "upstream error\n").into_response();
         }
     };
-    // likewise start ffmpeg before the 200 header is sent. The master playlist
-    // is private to this stream, so concurrent streams of one channel never
-    // rewrite or delete the playlist another one's ffmpeg is reading. Random
-    // name, created with O_EXCL and mode 0600; removed when `master` drops.
+    // take a slot only once resolved, so slow resolves can't lock everyone out
+    let Ok(permit) = state.streams.clone().try_acquire_owned() else {
+        tracing::warn!(channel, "too many streams");
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many streams\n").into_response();
+    };
+    // as with resolving, start ffmpeg before the 200 header is sent. The master
+    // playlist is private to this stream, so concurrent streams of one channel
+    // never rewrite or delete the playlist another one's ffmpeg is reading.
+    // Random name, created with O_EXCL and mode 0600; removed when `master` drops.
     let master = match tempfile::Builder::new()
         .prefix(&format!("tvp-{channel}-{}-", std::process::id()))
         .suffix(".m3u8")
@@ -113,9 +138,10 @@ async fn stream(State(state): State<Arc<AppState>>, Path(file): Path<String>) ->
         .expect("valid response")
 }
 
-/// Stream until the client goes away, ffmpeg keeps failing, or the server
-/// shuts down. In the last two cases the response ends with an error, so the
-/// client sees an aborted transfer rather than a normal end of stream.
+/// Stream until the client goes away, ffmpeg keeps failing or can't be
+/// restarted, or the server shuts down. In all but the first case the
+/// response ends with an error, so the client sees an aborted transfer rather
+/// than a normal end of stream.
 async fn pump(
     state: Arc<AppState>,
     channel: u64,
@@ -131,9 +157,14 @@ async fn pump(
     };
     if let Err(reason) = result {
         // hyper discards response data it has not written out yet when the
-        // body fails, so let it take everything sent so far first
-        let _ = tx.reserve_many(tx.max_capacity()).await;
-        let _ = tx.send(Err(std::io::Error::other(reason))).await;
+        // body fails, so let it take everything sent so far first. Not on
+        // shutdown: a client that stopped reading would hold us up forever.
+        tokio::select! {
+            _ = tx.reserve_many(tx.max_capacity()) => {}
+            () = state.shutdown.cancelled() => {}
+        }
+        // if the channel is still full, the client isn't reading anyway
+        let _ = tx.try_send(Err(std::io::Error::other(reason)));
     }
     tracing::info!(channel, "stream ended");
 }

@@ -15,13 +15,17 @@ usage:
   tvp-vod-proxy -h | --help         show this help
 
 environment:
+  MAX_BITRATE  highest average variant bitrate in bit/s, 0 = no limit (default 0)
+  MAX_STREAMS  maximum concurrent streams, 0 = no limit (default 10)
   BIND         listen address (default 0.0.0.0)
   PORT         listen port (default 8080)
-  MAX_STREAMS  maximum concurrent streams, 0 = no limit (default 10)
-  MAX_BITRATE  highest average variant bitrate in bit/s, 0 = no limit (default 0)
   FFMPEG       ffmpeg binary (default ffmpeg)
   TVP_API      API base URL (default https://vod.tvp.pl)
   RUST_LOG     log filter (default info)";
+
+/// How long shutdown waits for running streams to end, well within the 10 s
+/// `docker stop` allows before it kills the container.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 fn env<T: std::str::FromStr>(name: &str, default: T) -> anyhow::Result<T>
 where
@@ -82,17 +86,17 @@ async fn serve(client: tvp::Client) -> anyhow::Result<()> {
         quick_failure: Duration::from_secs(30),
         streams: Arc::new(Semaphore::new(max_streams)),
         shutdown: shutdown.clone(),
+        shutdown_grace: SHUTDOWN_GRACE,
     };
     let listener = tokio::net::TcpListener::bind((bind, port)).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
-    axum::serve(listener, server::router(state))
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            tracing::info!("shutting down");
-            // end running streams, or graceful shutdown would wait for them forever
-            shutdown.cancel();
-        })
-        .await?;
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("shutting down");
+        // end running streams, or graceful shutdown would wait for them forever
+        shutdown.cancel();
+    });
+    server::serve(listener, state).await?;
     Ok(())
 }
 

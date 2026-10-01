@@ -21,10 +21,8 @@ struct Variant {
     audio_group: Option<String>,
 }
 
-/// `CODECS` prefixes (RFC 6381 sample entry codes) of video codecs.
-const VIDEO_CODECS: [&str; 10] = [
-    "avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe", "dva1", "dvav", "av01", "vp09",
-];
+/// `CODECS` prefixes (RFC 6381 sample entry codes) of audio codecs.
+const AUDIO_CODECS: [&str; 6] = ["mp4a", "ac-3", "ec-3", "opus", "flac", "alac"];
 
 /// Value of `KEY=` in an `#EXT-X-...:` attribute list. Handles quoted values.
 /// Malformed tokens (no `=`, unterminated quote) are skipped rather than
@@ -64,13 +62,17 @@ fn http_url(base: &Url, uri: &str) -> Option<Url> {
         .filter(|u| matches!(u.scheme(), "http" | "https"))
 }
 
-/// False if the variant's `CODECS` lists no video codec (an audio-only
-/// variant). Without `CODECS` we can't tell and assume it has video.
+/// False if every codec in the variant's `CODECS` is a known audio codec (an
+/// audio-only variant). Anything else, including a missing or empty `CODECS`
+/// or an unknown codec, is assumed to have video.
 fn has_video(stream_inf: &str) -> bool {
     attr(stream_inf, "CODECS").is_none_or(|codecs| {
-        codecs
-            .split(',')
-            .any(|c| VIDEO_CODECS.iter().any(|v| c.trim().starts_with(v)))
+        !codecs.split(',').all(|c| {
+            let c = c.trim();
+            AUDIO_CODECS
+                .iter()
+                .any(|a| c.get(..a.len()).is_some_and(|p| p.eq_ignore_ascii_case(a)))
+        })
     })
 }
 
@@ -92,8 +94,8 @@ fn variants(master: &str, base: &Url) -> Vec<Variant> {
             continue;
         };
         let rate = attr(line, "AVERAGE-BANDWIDTH")
-            .or_else(|| attr(line, "BANDWIDTH"))
-            .and_then(|v| v.parse().ok());
+            .and_then(|v| v.parse().ok())
+            .or_else(|| attr(line, "BANDWIDTH").and_then(|v| v.parse().ok()));
         let (Some(bitrate), Some(url)) = (rate, http_url(base, uri)) else {
             continue;
         };
@@ -301,6 +303,29 @@ mod tests {
         assert!(is_master(m));
         let audio_only = m.replace("hvc1.1.6.L93.B0", "ec-3");
         assert_eq!(select(&audio_only, &base(), 0), None);
+    }
+
+    #[test]
+    fn only_known_audio_codecs_make_a_variant_audio_only() {
+        // anything that isn't a known audio codec counts as video, even ""
+        for codecs in [
+            "AVC1.64001F,MP4A.40.2",
+            "mp4v.20.9,mp4a.40.2",
+            "vvc1.1.L93",
+            "",
+        ] {
+            let m = format!("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS=\"{codecs}\"\nv.m3u8\n");
+            assert!(select(&m, &base(), 0).is_some(), "{codecs}");
+        }
+        // audio codecs are recognised in any case
+        let m = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS=\"MP4A.40.2,EC-3\"\nv.m3u8\n";
+        assert_eq!(select(m, &base(), 0), None);
+    }
+
+    #[test]
+    fn invalid_average_bandwidth_falls_back_to_bandwidth() {
+        let m = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000,AVERAGE-BANDWIDTH=x\nv.m3u8\n";
+        assert_eq!(select(m, &base(), 0).unwrap().bitrate, 1000);
     }
 
     #[test]
