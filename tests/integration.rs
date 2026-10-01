@@ -450,22 +450,28 @@ async fn ffmpeg_start_failure_returns_500() {
 }
 
 #[tokio::test]
-async fn giving_up_aborts_the_response() {
-    let dir = tempfile::tempdir().unwrap();
+async fn failing_ffmpeg_aborts_the_response() {
     let mock = MockServer::start().await;
     mock_channel(&mock, 9).await;
-    let addr = serve(stub_state(&mock.uri(), dir.path(), "printf X; exit 1")).await;
-
-    let mut resp = reqwest::get(format!("http://{addr}/tvp/9.ts"))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let (body, end) = tokio::time::timeout(Duration::from_secs(10), read_to_end(&mut resp))
-        .await
-        .expect("stream ended");
-    // one byte per ffmpeg run, then an aborted transfer, not a clean end
-    assert_eq!(body, b"XXX");
-    assert!(end.is_err(), "response ended cleanly");
+    for (script, expected) in [
+        // gives up after 3 quick failures
+        ("printf X; exit 1", "XXX"),
+        // cannot be restarted
+        ("printf X; rm -- \"$0\"; exit 1", "X"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = serve(stub_state(&mock.uri(), dir.path(), script)).await;
+        let mut resp = reqwest::get(format!("http://{addr}/tvp/9.ts"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let (body, end) = tokio::time::timeout(Duration::from_secs(10), read_to_end(&mut resp))
+            .await
+            .expect("stream ended");
+        // one byte per ffmpeg run, then an aborted transfer, not a clean end
+        assert_eq!(body, expected.as_bytes(), "{script}");
+        assert!(end.is_err(), "response ended cleanly: {script}");
+    }
 }
 
 #[tokio::test]

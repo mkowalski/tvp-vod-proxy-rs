@@ -175,10 +175,11 @@ The integration tests generate a small TVP-like HLS stream (two fMP4 video
 variants and a separate audio rendition) with ffmpeg, serve it from a mock
 TVP API/CDN, and check the proxy's output: one video + one audio track,
 variant selection, DRM → 415, API errors → 502, and that ffmpeg is stopped
-when the client disconnects. A stub ffmpeg script covers start failures (500),
-giving up after repeated failures, the stream limit (503) and shutdown. No test
-talks to the real TVP. Without ffmpeg/ffprobe the streaming tests are skipped,
-unless `CI` is set, in which case they fail.
+when the client disconnects. Without real ffmpeg they also check start failures
+(500), that the response is aborted when ffmpeg keeps failing or can't be
+restarted, the stream limit (503) and shutdown. No test talks to the real TVP.
+Without ffmpeg/ffprobe the streaming tests are skipped, unless `CI` is set, in
+which case they fail.
 
 CI runs formatting, clippy, tests, `cargo-deny` and a Docker build on every
 push and pull request. Pushing a `v*` tag publishes a multi-arch image to GHCR.
