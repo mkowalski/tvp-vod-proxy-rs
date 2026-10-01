@@ -42,6 +42,7 @@ services:
     network_mode: service:wg         # all proxy traffic goes through the tunnel
     # The image's healthcheck only checks the proxy process. This one also
     # checks that TVP is reachable, so a dead tunnel shows up as unhealthy.
+    # 8080 must match PORT if you set it.
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz && wget -q -T 10 -O /dev/null https://vod.tvp.pl/ || exit 1"]
       interval: 5m

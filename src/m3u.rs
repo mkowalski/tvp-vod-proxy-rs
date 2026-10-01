@@ -6,7 +6,7 @@ use crate::tvp::LiveItem;
 pub fn logo(item: &LiveItem) -> Option<String> {
     ["logo", "16x9"].iter().find_map(|k| {
         let url = item.images.get(*k)?.get(0)?.get("url")?.as_str()?;
-        let url: String = url
+        let url = url
             .chars()
             .filter(|c| !c.is_control())
             .collect::<String>()
