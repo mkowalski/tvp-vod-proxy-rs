@@ -65,7 +65,10 @@ async fn stream(State(state): State<Arc<AppState>>, Path(file): Path<String>) ->
     tracing::info!(channel, bitrate = selection.bitrate, "stream started");
 
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(32);
-    tokio::spawn(pump(state, channel, selection, tx));
+    tokio::spawn(async move {
+        pump(state, channel, selection, tx).await;
+        tracing::info!(channel, "stream ended");
+    });
 
     Response::builder()
         .header(header::CONTENT_TYPE, "video/mp2t")
@@ -74,7 +77,7 @@ async fn stream(State(state): State<Arc<AppState>>, Path(file): Path<String>) ->
 }
 
 /// Run ffmpeg, forward its output, and restart with a fresh URL when it stops.
-/// Ends when the client goes away (send fails) or ffmpeg keeps failing quickly.
+/// Ends when the client goes away or ffmpeg keeps failing quickly.
 async fn pump(
     state: Arc<AppState>,
     channel: u64,
@@ -119,13 +122,19 @@ async fn pump(
             break;
         }
         tracing::warn!(channel, secs = ran.as_secs(), "ffmpeg ended, re-resolving");
-        tokio::time::sleep(state.retry_delay).await;
-        match state.client.resolve(channel).await {
+        let resolved = tokio::select! {
+            r = async {
+                tokio::time::sleep(state.retry_delay).await;
+                state.client.resolve(channel).await
+            } => r,
+            // don't restart ffmpeg for a client that left in the meantime
+            () = tx.closed() => break,
+        };
+        match resolved {
             Ok(sel) => selection = sel,
             Err(e) => tracing::warn!(channel, error = %e, "re-resolve failed, retrying old URL"),
         }
     }
-    tracing::info!(channel, "stream ended");
 }
 
 /// Returns Ok(true) if the client disconnected, Ok(false) if ffmpeg exited.
@@ -138,6 +147,8 @@ async fn run_ffmpeg(
         .args(["-hide_banner", "-loglevel", "error"])
         .args(["-protocol_whitelist", "file,http,https,tcp,tls,crypto,data"])
         .args(["-analyzeduration", "15000000", "-probesize", "20000000"])
+        // fail upstream reads that stall for 15 s instead of hanging forever
+        .args(["-rw_timeout", "15000000"])
         .arg("-i")
         .arg(master)
         .args([
@@ -150,9 +161,13 @@ async fn run_ffmpeg(
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut buf = vec![0u8; 64 * 1024];
     let gone = loop {
-        let n = match stdout.read(&mut buf).await {
-            Ok(0) | Err(_) => break false,
-            Ok(n) => n,
+        let n = tokio::select! {
+            r = stdout.read(&mut buf) => match r {
+                Ok(0) | Err(_) => break false,
+                Ok(n) => n,
+            },
+            // notice a disconnect even while ffmpeg produces no output
+            () = tx.closed() => break true,
         };
         if tx
             .send(Ok(Bytes::copy_from_slice(&buf[..n])))

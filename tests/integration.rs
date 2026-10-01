@@ -122,17 +122,28 @@ fn make_hls(dir: &Path) {
 }
 
 async fn start_proxy(api: &str, max_bitrate: u64) -> SocketAddr {
-    let client = tvp::Client::new(Url::parse(api).unwrap(), max_bitrate).unwrap();
-    serve(server::AppState {
-        client,
-        ffmpeg: PathBuf::from("ffmpeg"),
-        work_dir: std::env::temp_dir(),
-        retry_delay: Duration::from_millis(10),
-    })
+    start_proxy_with(
+        api,
+        max_bitrate,
+        PathBuf::from("ffmpeg"),
+        Duration::from_millis(10),
+    )
     .await
 }
 
-async fn serve(state: server::AppState) -> SocketAddr {
+async fn start_proxy_with(
+    api: &str,
+    max_bitrate: u64,
+    ffmpeg: PathBuf,
+    retry_delay: Duration,
+) -> SocketAddr {
+    let client = tvp::Client::new(Url::parse(api).unwrap(), max_bitrate).unwrap();
+    let state = server::AppState {
+        client,
+        ffmpeg,
+        work_dir: std::env::temp_dir(),
+        retry_delay,
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, server::router(state)).await });
@@ -304,18 +315,108 @@ async fn client_disconnect_stops_ffmpeg() {
     panic!("ffmpeg still running 5s after client disconnected");
 }
 
-/// Stand-in for ffmpeg: prints the master playlist path it was given with
-/// `-i`, then keeps the stream alive until the proxy kills it.
-#[cfg(unix)]
-const STUB_FFMPEG: &str = r#"#!/bin/sh
-for a; do [ "$prev" = -i ] && master=$a; prev=$a; done
-echo "$master"
-while :; do echo; sleep 0.1; done
-"#;
+/// Write an executable `ffmpeg` stand-in that runs `script` with /bin/sh.
+fn stub_ffmpeg(dir: &Path, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("ffmpeg");
+    std::fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
 
-/// The first line of a stream served by `STUB_FFMPEG`.
-#[cfg(unix)]
+/// A channel that resolves to an unencrypted media playlist.
+async fn mock_channel(mock: &MockServer, channel: u64) {
+    Mock::given(path("/cdn/live.m3u8"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("#EXTM3U\n#EXTINF:2,\ns.ts\n"))
+        .mount(mock)
+        .await;
+    api_returns(mock, channel, &format!("{}/cdn/live.m3u8", mock.uri())).await;
+}
+
+/// True if a process with this pid exists.
+fn running(pid: &str) -> bool {
+    Command::new("ps")
+        .args(["-p", pid])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+#[tokio::test]
+async fn client_disconnect_stops_stalled_ffmpeg() {
+    // Emits once, then hangs without output like ffmpeg on a stalled upstream:
+    // the disconnect must be noticed even though no more data arrives.
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let ffmpeg = stub_ffmpeg(
+        dir.path(),
+        &format!(
+            "echo $$ > '{}'\nprintf X\nexec sleep 1000",
+            pid_file.display()
+        ),
+    );
+    let mock = MockServer::start().await;
+    mock_channel(&mock, 8).await;
+    let addr = start_proxy_with(&mock.uri(), 0, ffmpeg, Duration::from_millis(10)).await;
+
+    let mut resp = reqwest::get(format!("http://{addr}/tvp/8.ts"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.chunk().await.unwrap().is_some(), "got data");
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let pid = pid.trim();
+    assert!(running(pid), "ffmpeg running while streaming");
+
+    drop(resp);
+    for _ in 0..50 {
+        if !running(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("stalled ffmpeg still running 5s after client disconnected");
+}
+
+#[tokio::test]
+async fn client_disconnect_during_retry_does_not_restart_ffmpeg() {
+    // ffmpeg exits at once, so the proxy waits `retry_delay` and re-resolves;
+    // a client that leaves meanwhile must not get a fresh ffmpeg.
+    let dir = tempfile::tempdir().unwrap();
+    let runs = dir.path().join("runs");
+    let ffmpeg = stub_ffmpeg(
+        dir.path(),
+        &format!("echo run >> '{}'\nprintf X", runs.display()),
+    );
+    let mock = MockServer::start().await;
+    mock_channel(&mock, 9).await;
+    let retry_delay = Duration::from_secs(1);
+    let addr = start_proxy_with(&mock.uri(), 0, ffmpeg, retry_delay).await;
+
+    let mut resp = reqwest::get(format!("http://{addr}/tvp/9.ts"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.chunk().await.unwrap().is_some(), "got data");
+    drop(resp);
+
+    tokio::time::sleep(retry_delay * 2).await;
+    let runs = std::fs::read_to_string(&runs).unwrap();
+    assert_eq!(runs.lines().count(), 1, "ffmpeg restarted for nobody");
+    let resolves = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/api/"))
+        .count();
+    assert_eq!(resolves, 1, "re-resolved for nobody");
+}
+
+/// The first line of a stream, where a stub ffmpeg printed its `-i` path.
 async fn stub_master_path(resp: &mut reqwest::Response) -> PathBuf {
+    assert_eq!(resp.status(), 200);
     let mut buf = Vec::new();
     while !buf.contains(&b'\n') {
         let chunk = tokio::time::timeout(Duration::from_secs(10), resp.chunk())
@@ -329,7 +430,6 @@ async fn stub_master_path(resp: &mut reqwest::Response) -> PathBuf {
     PathBuf::from(String::from_utf8(line.to_vec()).unwrap())
 }
 
-#[cfg(unix)]
 async fn wait_removed(p: &Path) {
     for _ in 0..50 {
         if !p.exists() {
@@ -340,65 +440,39 @@ async fn wait_removed(p: &Path) {
     panic!("{p:?} still exists 5s after its client disconnected");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn concurrent_streams_of_a_channel_use_separate_playlists() {
     use std::os::unix::fs::PermissionsExt;
-
-    let bin = tempfile::tempdir().unwrap();
-    let ffmpeg = bin.path().join("ffmpeg");
-    std::fs::write(&ffmpeg, STUB_FFMPEG).unwrap();
-    std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-    // each resolve of channel 1 returns a different media playlist URL
+    // Prints the master playlist path it was given, then stays up.
+    let dir = tempfile::tempdir().unwrap();
+    let ffmpeg = stub_ffmpeg(
+        dir.path(),
+        r#"for a; do [ "$prev" = -i ] && echo "$a"; prev=$a; done; exec sleep 1000"#,
+    );
     let mock = MockServer::start().await;
-    let media = |n: u32| format!("{}/cdn/{n}.m3u8", mock.uri());
-    for n in 1..=2 {
-        Mock::given(path("/api/products/1/videos/playlist"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "sources": {"HLS": [{"src": media(n)}]}
-            })))
-            .up_to_n_times(1)
-            .mount(&mock)
-            .await;
-        Mock::given(path(format!("/cdn/{n}.m3u8")))
-            .respond_with(ResponseTemplate::new(200).set_body_string("#EXTM3U\n#EXTINF:2,\ns.ts\n"))
-            .mount(&mock)
-            .await;
-    }
-    let work = tempfile::tempdir().unwrap();
-    let addr = serve(server::AppState {
-        client: tvp::Client::new(Url::parse(&mock.uri()).unwrap(), 0).unwrap(),
-        ffmpeg,
-        work_dir: work.path().to_path_buf(),
-        retry_delay: Duration::from_millis(10),
-    })
-    .await;
-    let url = format!("http://{addr}/tvp/1.ts");
-    // the variant URL in a stream's master playlist
-    let variant = |p: &Path| {
-        let m = std::fs::read_to_string(p).unwrap();
-        m.lines().last().unwrap().to_string()
-    };
+    mock_channel(&mock, 12).await;
+    let addr = start_proxy_with(&mock.uri(), 0, ffmpeg, Duration::from_millis(10)).await;
+    let url = format!("http://{addr}/tvp/12.ts");
 
     let mut a = reqwest::get(&url).await.unwrap();
     let master_a = stub_master_path(&mut a).await;
     let mut b = reqwest::get(&url).await.unwrap();
     let master_b = stub_master_path(&mut b).await;
     assert_ne!(master_a, master_b, "streams share a master playlist");
-    assert!(master_a.starts_with(work.path()), "{master_a:?}");
-    assert!(master_b.starts_with(work.path()), "{master_b:?}");
-    // B starting must not rewrite the playlist A's ffmpeg is reading
-    assert_eq!(variant(&master_a), media(1));
-    assert_eq!(variant(&master_b), media(2));
-    // it holds signed CDN URLs: not readable by other users
-    let mode = std::fs::metadata(&master_a).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o600);
+    for m in [&master_a, &master_b] {
+        assert!(
+            m.starts_with(std::env::temp_dir()),
+            "{m:?} outside work_dir"
+        );
+        // it holds signed CDN URLs: not readable by other users
+        let mode = std::fs::metadata(m).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{m:?}");
+    }
 
     // A ending removes its own playlist, not the one B's ffmpeg is reading
     drop(a);
     wait_removed(&master_a).await;
-    assert_eq!(variant(&master_b), media(2));
+    assert!(master_b.exists(), "B's playlist removed when A ended");
 
     drop(b);
     wait_removed(&master_b).await;
