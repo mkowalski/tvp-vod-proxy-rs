@@ -18,7 +18,10 @@ services:
     volumes:
       - ./wireguard:/config          # wg_confs/wg0.conf, see wireguard/wg0.conf.example
     ports:
-      - "38099:8080"                 # proxy listens in this namespace
+      # proxy listens in this namespace. Published on loopback only: for clients on
+      # other machines or containers use the host's LAN address instead,
+      # e.g. "192.0.2.10:38099:8080". Never publish it on a public interface.
+      - "127.0.0.1:38099:8080"
     networks: [tvp-pl]
     healthcheck:
       # the whole point: traffic must leave from Poland

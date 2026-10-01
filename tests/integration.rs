@@ -1,10 +1,15 @@
 //! End-to-end tests against a mock TVP API/CDN. Streaming tests need ffmpeg and
-//! ffprobe on PATH and are skipped (with a message) if they are missing.
+//! ffprobe on PATH; if they are missing the tests are skipped with a message,
+//! or fail when `CI` is set. Tests of the proxy's own error handling run a
+//! shell script in place of ffmpeg.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tvp_vod_proxy::{server, tvp};
 use url::Url;
 use wiremock::matchers::{method, path};
@@ -15,6 +20,20 @@ fn have(bin: &str) -> bool {
         .arg("-version")
         .output()
         .is_ok_and(|o| o.status.success())
+}
+
+/// True if ffmpeg and ffprobe are on PATH. On CI they must be, so a broken
+/// install fails the streaming tests instead of silently skipping them.
+fn ffmpeg_available() -> bool {
+    if have("ffmpeg") && have("ffprobe") {
+        return true;
+    }
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "ffmpeg/ffprobe not found (required when CI is set)"
+    );
+    eprintln!("skipping: ffmpeg/ffprobe not found");
+    false
 }
 
 /// Mount every file in `dir` under `/cdn/<name>`.
@@ -39,6 +58,25 @@ async fn api_returns(mock: &MockServer, channel: u64, master_url: &str) {
         })))
         .mount(mock)
         .await;
+}
+
+async fn mount(mock: &MockServer, p: &str, body: &str) {
+    Mock::given(method("GET"))
+        .and(path(p))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(mock)
+        .await;
+}
+
+/// An unencrypted media playlist.
+const MEDIA: &str = "#EXTM3U\n#EXTINF:2.0,\nseg.ts\n";
+
+/// Channel `id` with a one-variant master (for tests that don't read media).
+async fn mock_channel(mock: &MockServer, id: u64) {
+    let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n";
+    mount(mock, "/cdn/master.m3u8", master).await;
+    mount(mock, "/cdn/v.m3u8", MEDIA).await;
+    api_returns(mock, id, &format!("{}/cdn/master.m3u8", mock.uri())).await;
 }
 
 /// Build a TVP-like VOD HLS: two fMP4 video variants and a separate audio rendition.
@@ -121,24 +159,60 @@ fn make_hls(dir: &Path) {
     .unwrap();
 }
 
-async fn start_proxy(api: &str, max_bitrate: u64) -> SocketAddr {
-    let client = tvp::Client::new(Url::parse(api).unwrap(), max_bitrate).unwrap();
-    let state = server::AppState {
-        client,
+fn state(api: &str, max_bitrate: u64) -> server::AppState {
+    server::AppState {
+        client: tvp::Client::new(Url::parse(api).unwrap(), max_bitrate).unwrap(),
         ffmpeg: PathBuf::from("ffmpeg"),
         work_dir: std::env::temp_dir(),
         retry_delay: Duration::from_millis(10),
-    };
+        streams: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+        shutdown: CancellationToken::new(),
+    }
+}
+
+/// Proxy state that runs `script` in place of ffmpeg and works in `dir`.
+fn stub_state(api: &str, dir: &Path, script: &str) -> server::AppState {
+    use std::os::unix::fs::PermissionsExt;
+    let ffmpeg = dir.join("ffmpeg");
+    std::fs::write(&ffmpeg, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    server::AppState {
+        ffmpeg,
+        work_dir: dir.to_path_buf(),
+        ..state(api, 0)
+    }
+}
+
+async fn serve(state: server::AppState) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, server::router(state)).await });
     addr
 }
 
+async fn start_proxy(api: &str, max_bitrate: u64) -> SocketAddr {
+    serve(state(api, max_bitrate)).await
+}
+
+/// Read a response to its end. Also returns how it ended: `Err` if the
+/// transfer was aborted rather than finished normally.
+async fn read_to_end(resp: &mut reqwest::Response) -> (Vec<u8>, reqwest::Result<()>) {
+    let mut body = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(None) => return (body, Ok(())),
+            Err(e) => return (body, Err(e)),
+        }
+    }
+}
+
 /// Download a stream (bounded by time) and return ffprobe's stream summary.
 async fn probe(url: &str) -> Vec<String> {
-    let bytes = tokio::time::timeout(Duration::from_secs(60), async {
-        reqwest::get(url).await.unwrap().bytes().await.unwrap()
+    let (bytes, _) = tokio::time::timeout(Duration::from_secs(60), async {
+        let mut resp = reqwest::get(url).await.unwrap();
+        // the response ends with an error once ffmpeg gives up on the VOD input
+        read_to_end(&mut resp).await
     })
     .await
     .expect("stream finished");
@@ -170,8 +244,7 @@ async fn probe(url: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn streams_one_video_and_one_audio_as_mpegts() {
-    if !have("ffmpeg") || !have("ffprobe") {
-        eprintln!("skipping: ffmpeg/ffprobe not found");
+    if !ffmpeg_available() {
         return;
     }
     let hls = tempfile::tempdir().unwrap();
@@ -259,8 +332,7 @@ fn ffmpeg_running(needle: &str) -> usize {
 
 #[tokio::test]
 async fn client_disconnect_stops_ffmpeg() {
-    if !have("ffmpeg") {
-        eprintln!("skipping: ffmpeg not found");
+    if !ffmpeg_available() {
         return;
     }
     // A live playlist (no ENDLIST) that the mock keeps serving: ffmpeg would
@@ -298,4 +370,176 @@ async fn client_disconnect_stops_ffmpeg() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("ffmpeg still running 5s after client disconnected");
+}
+
+#[tokio::test]
+async fn drm_in_master_or_audio_returns_415() {
+    let mock = MockServer::start().await;
+    let drm = include_str!("fixtures/media_drm.m3u8");
+    mount(&mock, "/cdn/v.m3u8", MEDIA).await;
+    mount(&mock, "/cdn/a.m3u8", drm).await;
+    let session_key = "#EXTM3U\n\
+                       #EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI=\"skd://key\"\n\
+                       #EXT-X-STREAM-INF:BANDWIDTH=1\n\
+                       v.m3u8\n";
+    let drm_audio = "#EXTM3U\n\
+                     #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",DEFAULT=YES,URI=\"a.m3u8\"\n\
+                     #EXT-X-STREAM-INF:BANDWIDTH=1,AUDIO=\"a\"\n\
+                     v.m3u8\n";
+    mount(&mock, "/cdn/session_key.m3u8", session_key).await;
+    mount(&mock, "/cdn/drm_audio.m3u8", drm_audio).await;
+    api_returns(&mock, 4, &format!("{}/cdn/session_key.m3u8", mock.uri())).await;
+    api_returns(&mock, 5, &format!("{}/cdn/drm_audio.m3u8", mock.uri())).await;
+    let addr = start_proxy(&mock.uri(), 0).await;
+    for id in [4, 5] {
+        let r = reqwest::get(format!("http://{addr}/tvp/{id}.ts"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 415, "channel {id}");
+    }
+}
+
+#[tokio::test]
+async fn master_without_playable_variant_returns_502() {
+    let mock = MockServer::start().await;
+    // no BANDWIDTH: not a media playlist, but no variant can be chosen either
+    let master = "#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=1920x1080\nv.m3u8\n";
+    mount(&mock, "/cdn/master.m3u8", master).await;
+    mount(&mock, "/cdn/v.m3u8", MEDIA).await;
+    api_returns(&mock, 6, &format!("{}/cdn/master.m3u8", mock.uri())).await;
+    let addr = start_proxy(&mock.uri(), 0).await;
+    let r = reqwest::get(format!("http://{addr}/tvp/6.ts"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502);
+}
+
+#[tokio::test]
+async fn invalid_api_json_is_reported() {
+    let mock = MockServer::start().await;
+    for p in ["/api/products/12/videos/playlist", "/api/products/lives"] {
+        mount(&mock, p, "<html>maintenance</html>").await;
+    }
+    let client = tvp::Client::new(Url::parse(&mock.uri()).unwrap(), 0).unwrap();
+    let e = client.resolve(12).await.unwrap_err();
+    assert!(matches!(e, tvp::ResolveError::Json(_)), "{e:?}");
+    let e = client.lives().await.unwrap_err();
+    assert!(matches!(e, tvp::ResolveError::Json(_)), "{e:?}");
+}
+
+#[tokio::test]
+async fn ffmpeg_start_failure_returns_500() {
+    let mock = MockServer::start().await;
+    mock_channel(&mock, 8).await;
+    let nowhere = PathBuf::from("/nonexistent");
+    let missing_ffmpeg = server::AppState {
+        ffmpeg: nowhere.join("ffmpeg"),
+        ..state(&mock.uri(), 0)
+    };
+    let missing_work_dir = server::AppState {
+        work_dir: nowhere,
+        ..state(&mock.uri(), 0)
+    };
+    for st in [missing_ffmpeg, missing_work_dir] {
+        let addr = serve(st).await;
+        let r = reqwest::get(format!("http://{addr}/tvp/8.ts"))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 500);
+    }
+}
+
+#[tokio::test]
+async fn giving_up_aborts_the_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = MockServer::start().await;
+    mock_channel(&mock, 9).await;
+    let addr = serve(stub_state(&mock.uri(), dir.path(), "printf X; exit 1")).await;
+
+    let mut resp = reqwest::get(format!("http://{addr}/tvp/9.ts"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let (body, end) = tokio::time::timeout(Duration::from_secs(10), read_to_end(&mut resp))
+        .await
+        .expect("stream ended");
+    // one byte per ffmpeg run, then an aborted transfer, not a clean end
+    assert_eq!(body, b"XXX");
+    assert!(end.is_err(), "response ended cleanly");
+}
+
+#[tokio::test]
+async fn too_many_streams_return_503() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = MockServer::start().await;
+    mock_channel(&mock, 10).await;
+    let script = "while :; do printf X; sleep 0.1; done";
+    let st = server::AppState {
+        streams: Arc::new(Semaphore::new(1)),
+        ..stub_state(&mock.uri(), dir.path(), script)
+    };
+    let streams = st.streams.clone();
+    let url = format!("http://{}/tvp/10.ts", serve(st).await);
+
+    let mut first = reqwest::get(&url).await.unwrap();
+    assert_eq!(first.status(), 200);
+    assert!(first.chunk().await.unwrap().is_some(), "got data");
+    assert_eq!(reqwest::get(&url).await.unwrap().status(), 503);
+
+    // the slot is freed once the client goes away
+    drop(first);
+    for _ in 0..50 {
+        if streams.available_permits() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(reqwest::get(&url).await.unwrap().status(), 200);
+}
+
+#[tokio::test]
+async fn shutdown_ends_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = MockServer::start().await;
+    mock_channel(&mock, 11).await;
+    let script = "while :; do printf X; sleep 0.1; done";
+    let st = stub_state(&mock.uri(), dir.path(), script);
+    let shutdown = st.shutdown.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stopped = shutdown.clone().cancelled_owned();
+    let serving = tokio::spawn(async move {
+        axum::serve(listener, server::router(st))
+            .with_graceful_shutdown(stopped)
+            .await
+    });
+
+    let mut resp = reqwest::get(format!("http://{addr}/tvp/11.ts"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.chunk().await.unwrap().is_some(), "got data");
+    let stub = dir.path().to_str().unwrap();
+    assert!(ffmpeg_running(stub) >= 1, "ffmpeg running while streaming");
+
+    shutdown.cancel();
+    let (_, end) = tokio::time::timeout(Duration::from_secs(5), read_to_end(&mut resp))
+        .await
+        .expect("stream ended");
+    assert!(end.is_err(), "response ended cleanly");
+    // graceful shutdown completes although a stream was running
+    tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("server stopped")
+        .unwrap()
+        .unwrap();
+    // the master playlist is removed; only the stub is left
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    for _ in 0..50 {
+        if ffmpeg_running(stub) == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("ffmpeg still running 5s after shutdown");
 }

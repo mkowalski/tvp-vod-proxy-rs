@@ -1,6 +1,10 @@
 use anyhow::Context;
+use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tvp_vod_proxy::{m3u, server, tvp};
 use url::Url;
 
@@ -10,7 +14,9 @@ usage:
   tvp-vod-proxy make-m3u HOST:PORT  print an M3U of all free, non-DRM channels
 
 environment:
+  BIND         listen address (default 0.0.0.0)
   PORT         listen port (default 8080)
+  MAX_STREAMS  maximum concurrent streams, 0 = no limit (default 10)
   MAX_BITRATE  highest average variant bitrate in bit/s, 0 = no limit (default 0)
   FFMPEG       ffmpeg binary (default ffmpeg)
   TVP_API      API base URL (default https://vod.tvp.pl)
@@ -57,21 +63,52 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve(client: tvp::Client) -> anyhow::Result<()> {
+    let bind: IpAddr = env("BIND", IpAddr::from([0, 0, 0, 0]))?;
     let port: u16 = env("PORT", 8080)?;
+    let max_streams = match env("MAX_STREAMS", 10usize)? {
+        0 => Semaphore::MAX_PERMITS,
+        n => n.min(Semaphore::MAX_PERMITS),
+    };
+    let shutdown = CancellationToken::new();
     let state = server::AppState {
         client,
         ffmpeg: PathBuf::from(env("FFMPEG", "ffmpeg".to_string())?),
         work_dir: std::env::temp_dir(),
         retry_delay: Duration::from_secs(1),
+        streams: Arc::new(Semaphore::new(max_streams)),
+        shutdown: shutdown.clone(),
     };
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
-    tracing::info!(port, "listening");
+    let listener = tokio::net::TcpListener::bind((bind, port)).await?;
+    tracing::info!(addr = %listener.local_addr()?, "listening");
     axum::serve(listener, server::router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            tracing::info!("shutting down");
+            // end running streams, or graceful shutdown would wait for them forever
+            shutdown.cancel();
         })
         .await?;
     Ok(())
+}
+
+/// Resolves on Ctrl-C (SIGINT) or SIGTERM (`docker stop`).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
 }
 
 async fn make_m3u(client: tvp::Client, host: &str) -> anyhow::Result<()> {

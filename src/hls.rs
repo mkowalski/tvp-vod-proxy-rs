@@ -17,9 +17,14 @@ pub struct Selection {
 #[derive(Debug, Clone)]
 struct Variant {
     bitrate: u64,
-    uri: String,
+    url: Url,
     audio_group: Option<String>,
 }
+
+/// `CODECS` prefixes (RFC 6381 sample entry codes) of video codecs.
+const VIDEO_CODECS: [&str; 10] = [
+    "avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe", "dva1", "dvav", "av01", "vp09",
+];
 
 /// Value of `KEY=` in an `#EXT-X-...:` attribute list. Handles quoted values.
 fn attr(line: &str, key: &str) -> Option<String> {
@@ -44,26 +49,51 @@ fn attr(line: &str, key: &str) -> Option<String> {
     None
 }
 
-fn variants(master: &str) -> Vec<Variant> {
-    let lines: Vec<&str> = master.lines().map(str::trim).collect();
+/// `uri` resolved against `base`, if that gives an http(s) URL. Playlists must
+/// not point ffmpeg at local files or other protocols.
+fn http_url(base: &Url, uri: &str) -> Option<Url> {
+    base.join(uri)
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https"))
+}
+
+/// False if the variant's `CODECS` lists no video codec (an audio-only
+/// variant). Without `CODECS` we can't tell and assume it has video.
+fn has_video(stream_inf: &str) -> bool {
+    attr(stream_inf, "CODECS").is_none_or(|codecs| {
+        codecs
+            .split(',')
+            .any(|c| VIDEO_CODECS.iter().any(|v| c.trim().starts_with(v)))
+    })
+}
+
+/// Playable video variants of a master playlist.
+fn variants(master: &str, base: &Url) -> Vec<Variant> {
+    // tags and URIs only: blank lines and comments are ignored (RFC 8216 4.1)
+    let mut lines = master
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && (!l.starts_with('#') || l.starts_with("#EXT")))
+        .peekable();
     let mut out = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
+    while let Some(line) = lines.next() {
         if !line.starts_with("#EXT-X-STREAM-INF:") {
             continue;
         }
-        let Some(uri) = lines[i + 1..]
-            .iter()
-            .find(|l| !l.is_empty() && !l.starts_with('#'))
-        else {
+        // the URI must come next; a tag there means it is missing
+        let Some(uri) = lines.next_if(|l| !l.starts_with('#')) else {
             continue;
         };
         let rate = attr(line, "AVERAGE-BANDWIDTH")
             .or_else(|| attr(line, "BANDWIDTH"))
             .and_then(|v| v.parse().ok());
-        if let Some(bitrate) = rate {
+        let (Some(bitrate), Some(url)) = (rate, http_url(base, uri)) else {
+            continue;
+        };
+        if has_video(line) {
             out.push(Variant {
                 bitrate,
-                uri: (*uri).to_string(),
+                url,
                 audio_group: attr(line, "AUDIO"),
             });
         }
@@ -71,11 +101,20 @@ fn variants(master: &str) -> Vec<Variant> {
     out
 }
 
+/// True if the playlist is a master playlist, i.e. it lists variant streams.
+pub fn is_master(playlist: &str) -> bool {
+    playlist
+        .lines()
+        .any(|l| l.trim().starts_with("#EXT-X-STREAM-INF:"))
+}
+
 /// Choose the highest-bitrate variant not above `max_bitrate` (0 = no limit).
 /// If every variant exceeds the cap, the lowest one is used.
-/// Returns `None` if the playlist has no variants (i.e. it is a media playlist).
+/// Returns `None` if the playlist has no usable variant: it is a media playlist
+/// (see [`is_master`]) or a master whose variants all lack a bitrate, a valid
+/// http(s) URI or video.
 pub fn select(master: &str, base: &Url, max_bitrate: u64) -> Option<Selection> {
-    let mut all = variants(master);
+    let mut all = variants(master, base);
     all.sort_by_key(|v| v.bitrate);
     let chosen = if max_bitrate == 0 {
         all.last()
@@ -87,31 +126,35 @@ pub fn select(master: &str, base: &Url, max_bitrate: u64) -> Option<Selection> {
     }?;
 
     let audio = chosen.audio_group.as_ref().and_then(|group| {
-        let renditions: Vec<&str> = master
+        master
             .lines()
             .map(str::trim)
             .filter(|l| l.starts_with("#EXT-X-MEDIA:"))
             .filter(|l| attr(l, "TYPE").as_deref() == Some("AUDIO"))
             .filter(|l| attr(l, "GROUP-ID").as_deref() == Some(group))
-            .filter(|l| attr(l, "URI").is_some())
-            .collect();
-        let default = renditions
-            .iter()
-            .find(|l| attr(l, "DEFAULT").is_some_and(|d| d.eq_ignore_ascii_case("YES")))
-            .or(renditions.first())?;
-        base.join(&attr(default, "URI")?).ok()
+            .filter_map(|l| Some((l, http_url(base, &attr(l, "URI")?)?)))
+            // DEFAULT=YES, else AUTOSELECT=YES, else the first listed;
+            // audio description only if there is nothing else
+            .min_by_key(|(l, _)| {
+                let yes = |key| attr(l, key).is_some_and(|v| v.eq_ignore_ascii_case("YES"));
+                let described = attr(l, "CHARACTERISTICS")
+                    .is_some_and(|c| c.contains("public.accessibility.describes-video"));
+                (described, !yes("DEFAULT"), !yes("AUTOSELECT"))
+            })
+            .map(|(_, url)| url)
     });
 
     Some(Selection {
         bitrate: chosen.bitrate,
-        video: base.join(&chosen.uri).ok()?,
+        video: chosen.url.clone(),
         audio,
     })
 }
 
-/// True if a media playlist is encrypted (FairPlay/Widevine/AES).
-pub fn is_encrypted(media: &str) -> bool {
-    media
+/// True if a playlist is encrypted (FairPlay/Widevine/AES): `EXT-X-KEY` in a
+/// media playlist or `EXT-X-SESSION-KEY` in a master playlist.
+pub fn is_encrypted(playlist: &str) -> bool {
+    playlist
         .lines()
         .map(str::trim)
         .filter(|l| l.starts_with("#EXT-X-KEY:") || l.starts_with("#EXT-X-SESSION-KEY:"))
@@ -206,6 +249,8 @@ mod tests {
     #[test]
     fn media_playlist_has_no_selection() {
         assert_eq!(select(DRM, &base(), 0), None);
+        assert!(!is_master(DRM));
+        assert!(is_master(TVP));
     }
 
     #[test]
@@ -213,6 +258,96 @@ mod tests {
         assert!(is_encrypted(DRM));
         assert!(!is_encrypted("#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n"));
         assert!(!is_encrypted("#EXTM3U\n#EXTINF:2.0,\nseg.mp4\n"));
+    }
+
+    #[test]
+    fn detects_drm_in_master() {
+        let m = format!("{TVP}#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI=\"skd://x\"\n");
+        assert!(is_encrypted(&m));
+        assert!(!is_encrypted(TVP));
+    }
+
+    #[test]
+    fn variant_without_uri_does_not_take_the_next_one() {
+        let m = "#EXTM3U\n\
+                 #EXT-X-STREAM-INF:BANDWIDTH=9000000\n\
+                 \n\
+                 #EXT-X-STREAM-INF:BANDWIDTH=1000\n\
+                 # a comment\n\
+                 low.m3u8\n";
+        for cap in [0, 5_000_000] {
+            let s = select(m, &base(), cap).unwrap();
+            assert_eq!(s.bitrate, 1000);
+            assert!(s.video.as_str().ends_with("/low.m3u8"));
+        }
+    }
+
+    #[test]
+    fn audio_only_variants_are_skipped() {
+        let m = "#EXTM3U\n\
+                 #EXT-X-STREAM-INF:BANDWIDTH=64000,CODECS=\"mp4a.40.2\"\n\
+                 audio.m3u8\n\
+                 #EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"mp4a.40.2,hvc1.1.6.L93.B0\"\n\
+                 video.m3u8\n";
+        let s = select(m, &base(), 100_000).unwrap();
+        assert!(s.video.as_str().ends_with("/video.m3u8"));
+        assert!(is_master(m));
+        let audio_only = m.replace("hvc1.1.6.L93.B0", "ec-3");
+        assert_eq!(select(&audio_only, &base(), 0), None);
+    }
+
+    #[test]
+    fn invalid_variants_give_no_selection() {
+        for m in [
+            "#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=1x1\nv.m3u8\n",
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n#EXT-X-ENDLIST\n",
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhttp://[::1\n",
+        ] {
+            assert!(is_master(m), "{m}");
+            assert_eq!(select(m, &base(), 0), None, "{m}");
+        }
+    }
+
+    #[test]
+    fn only_http_urls_are_used() {
+        let m = "#EXTM3U\n\
+                 #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",DEFAULT=YES,URI=\"file:///etc/passwd\"\n\
+                 #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"audio.m3u8\"\n\
+                 #EXT-X-STREAM-INF:BANDWIDTH=2000,AUDIO=\"a\"\n\
+                 data:application/vnd.apple.mpegurl;base64,AAAA\n\
+                 #EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"a\"\n\
+                 video.m3u8\n";
+        let s = select(m, &base(), 0).unwrap();
+        assert_eq!(s.bitrate, 1000);
+        assert_eq!(s.video.scheme(), "https");
+        assert!(s.audio.unwrap().as_str().ends_with("/audio.m3u8"));
+        let m = m.replace("URI=\"audio.m3u8\"", "URI=\"ftp://x/a.m3u8\"");
+        assert_eq!(select(&m, &base(), 0).unwrap().audio, None);
+    }
+
+    #[test]
+    fn audio_prefers_autoselect_over_listing_order() {
+        // the broadpeak master with its audio description listed first
+        let ad = "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio-aacl-211\",LANGUAGE=\"pol\",NAME=\"Audiodeskrypcja\",AUTOSELECT=NO,CHANNELS=\"2\",URI=\"TVP_Historia_2-audio_ad=211000.m3u8\"\n";
+        let m = BROADPEAK
+            .replace(ad, "")
+            .replace("# AUDIO groups\n", &format!("# AUDIO groups\n{ad}"));
+        assert!(m.find("Audiodeskrypcja") < m.find("Polski"));
+        let s = select(&m, &base(), 0).unwrap();
+        assert!(s.audio.unwrap().as_str().ends_with("audio_pol=211000.m3u8"));
+    }
+
+    #[test]
+    fn audio_description_only_as_last_resort() {
+        let ad = "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"AD\",DEFAULT=YES,AUTOSELECT=YES,CHARACTERISTICS=\"public.accessibility.describes-video\",URI=\"ad.m3u8\"\n";
+        let pol = "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Polski\",URI=\"pol.m3u8\"\n";
+        let audio = |renditions: &str| {
+            let m =
+                format!("#EXTM3U\n{renditions}#EXT-X-STREAM-INF:BANDWIDTH=1,AUDIO=\"a\"\nv.m3u8\n");
+            select(&m, &base(), 0).unwrap().audio.unwrap().to_string()
+        };
+        assert!(audio(&format!("{ad}{pol}")).ends_with("/pol.m3u8"));
+        assert!(audio(ad).ends_with("/ad.m3u8"));
     }
 
     #[test]
