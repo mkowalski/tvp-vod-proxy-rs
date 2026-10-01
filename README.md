@@ -168,6 +168,9 @@ variants and a separate audio rendition) with ffmpeg, serve it from a mock
 TVP API/CDN, and check the proxy's output: one video + one audio track,
 variant selection, DRM → 415, API errors → 502, and that ffmpeg is stopped
 (and not restarted) when the client disconnects, even while ffmpeg is stalled.
+Restart-loop tests use a shell script in place of ffmpeg: each restart
+re-resolves the URL (keeping the old one if that fails), three quick failures
+in a row end the stream, and a long run resets the count.
 No test talks to the real TVP.
 
 CI runs formatting, clippy, tests, `cargo-deny` and a Docker build on every
