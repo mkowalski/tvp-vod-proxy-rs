@@ -20,6 +20,10 @@ pub enum ResolveError {
     Drm,
     #[error("no HLS source for channel")]
     NoSource,
+    #[error("no playable variant in master playlist")]
+    NoVariant,
+    #[error("invalid API response: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("upstream: {0}")]
     Upstream(#[from] reqwest::Error),
     #[error("invalid URL: {0}")]
@@ -116,20 +120,21 @@ impl Client {
             .append_pair("platform", "BROWSER")
             .append_pair("videoType", "LIVE");
         let (_, body) = self.get(api).await?;
-        let playlist: Playlist = serde_json::from_str(&body).map_err(|_| ResolveError::NoSource)?;
+        let playlist: Playlist = serde_json::from_str(&body)?;
         let src = playlist
             .sources
             .and_then(|s| s.hls.into_iter().next())
             .ok_or(ResolveError::NoSource)?;
 
         let (base, master) = self.get(Url::parse(&src.src)?).await?;
+        if hls::is_encrypted(&master) {
+            return Err(ResolveError::Drm);
+        }
         let sel = match hls::select(&master, &base, self.max_bitrate) {
             Some(sel) => sel,
+            None if hls::is_master(&master) => return Err(ResolveError::NoVariant),
             // the URL already points at a media playlist
             None => {
-                if hls::is_encrypted(&master) {
-                    return Err(ResolveError::Drm);
-                }
                 return Ok(Selection {
                     bitrate: 0,
                     video: base,
@@ -137,9 +142,11 @@ impl Client {
                 });
             }
         };
-        let (_, media) = self.get(sel.video.clone()).await?;
-        if hls::is_encrypted(&media) {
-            return Err(ResolveError::Drm);
+        for url in std::iter::once(&sel.video).chain(&sel.audio) {
+            let (_, media) = self.get(url.clone()).await?;
+            if hls::is_encrypted(&media) {
+                return Err(ResolveError::Drm);
+            }
         }
         Ok(sel)
     }
@@ -152,7 +159,7 @@ impl Client {
             .append_pair("platform", "BROWSER")
             .append_pair("maxResults", &MAX_LIVES.to_string());
         let (_, body) = self.get(url).await?;
-        let lives: Lives = serde_json::from_str(&body).map_err(|_| ResolveError::NoSource)?;
+        let lives: Lives = serde_json::from_str(&body)?;
         if lives.items.len() >= MAX_LIVES {
             tracing::warn!(
                 count = lives.items.len(),

@@ -14,6 +14,6 @@ RUN apk add --no-cache ffmpeg ca-certificates \
 COPY --from=build /src/target/release/tvp-vod-proxy /usr/local/bin/tvp-vod-proxy
 USER proxy
 EXPOSE 8080
-HEALTHCHECK --interval=1m --timeout=5s CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+HEALTHCHECK --interval=1m --timeout=5s CMD wget -qO- "http://127.0.0.1:${PORT:-8080}/healthz" || exit 1
 ENTRYPOINT ["tvp-vod-proxy"]
 CMD ["serve"]
