@@ -8,7 +8,7 @@
 #   docker exec tvp-pl-proxy tvp-vod-proxy make-m3u <docker-host>:38099 > tvp.m3u
 services:
   wg:
-    image: lscr.io/linuxserver/wireguard:latest
+    image: lscr.io/linuxserver/wireguard:1.0.20260223-r0-ls123   # runs with NET_ADMIN: pin it
     container_name: tvp-pl-wg
     cap_add: [NET_ADMIN]
     sysctls:
@@ -24,7 +24,9 @@ services:
       - "127.0.0.1:38099:8080"
     networks: [tvp-pl]
     healthcheck:
-      # the whole point: traffic must leave from Poland
+      # the whole point: traffic must leave from Poland. This sends the
+      # tunnel's exit IP to ipinfo.io on every check; raise the interval or
+      # replace the URL if you'd rather not.
       test: ["CMD-SHELL", "curl -sf -m 10 https://ipinfo.io/country | grep -qx PL"]
       interval: 5m
       timeout: 15s
@@ -41,6 +43,14 @@ services:
     # environment:
     #   MAX_BITRATE: "4000000"       # cap the variant bitrate (bit/s); default 0 = no limit
     network_mode: service:wg         # all proxy traffic goes through the tunnel
+    # The image's healthcheck only checks the proxy process. This one also
+    # checks that TVP is reachable, so a dead tunnel shows up as unhealthy.
+    # 8080 must match PORT if you set it.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz && wget -q -T 10 -O /dev/null https://vod.tvp.pl/ || exit 1"]
+      interval: 5m
+      timeout: 20s
+      start_period: 30s
     depends_on:
       wg:
         condition: service_healthy

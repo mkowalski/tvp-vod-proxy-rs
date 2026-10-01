@@ -10,8 +10,9 @@ use url::Url;
 
 const USAGE: &str = "\
 usage:
-  tvp-vod-proxy [serve]           start the proxy (default)
-  tvp-vod-proxy make-m3u HOST:PORT  print an M3U of all free, non-DRM channels
+  tvp-vod-proxy [serve]             start the proxy (default)
+  tvp-vod-proxy make-m3u HOST:PORT  print an M3U of all playable channels
+  tvp-vod-proxy -h | --help         show this help
 
 environment:
   BIND         listen address (default 0.0.0.0)
@@ -22,11 +23,14 @@ environment:
   TVP_API      API base URL (default https://vod.tvp.pl)
   RUST_LOG     log filter (default info)";
 
-fn env<T: std::str::FromStr>(name: &str, default: T) -> anyhow::Result<T> {
+fn env<T: std::str::FromStr>(name: &str, default: T) -> anyhow::Result<T>
+where
+    T::Err: std::fmt::Display,
+{
     match std::env::var(name) {
         Ok(v) => v
             .parse()
-            .ok()
+            .map_err(|e| anyhow::anyhow!("{e}"))
             .with_context(|| format!("invalid {name}: {v}")),
         Err(_) => Ok(default),
     }
@@ -75,6 +79,7 @@ async fn serve(client: tvp::Client) -> anyhow::Result<()> {
         ffmpeg: PathBuf::from(env("FFMPEG", "ffmpeg".to_string())?),
         work_dir: std::env::temp_dir(),
         retry_delay: Duration::from_secs(1),
+        quick_failure: Duration::from_secs(30),
         streams: Arc::new(Semaphore::new(max_streams)),
         shutdown: shutdown.clone(),
     };
@@ -115,12 +120,14 @@ async fn make_m3u(client: tvp::Client, host: &str) -> anyhow::Result<()> {
     let mut playable = Vec::new();
     for item in client.lives().await? {
         if item.payable {
-            eprintln!("# skipped {} (paid)", item.title);
+            tracing::info!(channel = item.id, title = item.title, "skipped: paid");
             continue;
         }
         match client.resolve(item.id).await {
             Ok(_) => playable.push(item),
-            Err(e) => eprintln!("# skipped {} ({e})", item.title),
+            Err(e) => {
+                tracing::info!(channel = item.id, title = item.title, error = %e, "skipped")
+            }
         }
     }
     print!("{}", m3u::render(host, &playable));

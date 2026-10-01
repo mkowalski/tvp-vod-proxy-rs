@@ -1,4 +1,4 @@
-FROM rust:1-alpine AS build
+FROM rust:1.98-alpine3.24 AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 # cache dependencies separately from the source
@@ -8,7 +8,7 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs && touch src/lib.rs \
 COPY src ./src
 RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
-FROM alpine:3
+FROM alpine:3.24
 RUN apk add --no-cache ffmpeg ca-certificates \
     && adduser -D -H -u 10001 proxy
 COPY --from=build /src/target/release/tvp-vod-proxy /usr/local/bin/tvp-vod-proxy

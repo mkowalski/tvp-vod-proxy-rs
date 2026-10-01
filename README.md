@@ -49,7 +49,8 @@ Per request for `/tvp/<id>.ts`:
 1. The proxy asks TVP's API for the channel's current HLS URL (works only from
    a Polish IP, hence the tunnel).
 2. It reads the master playlist and selects the highest video variant (or the
-   highest under `MAX_BITRATE`, if set), plus the default audio rendition.
+   highest under `MAX_BITRATE`, if set; if every variant is above it, the
+   lowest one), plus the default audio rendition.
    DRM-protected channels are rejected with HTTP 415.
 3. It writes a one-variant master playlist and runs `ffmpeg -c copy` on it,
    streaming MPEG-TS to the client. Reading video and audio as **one** HLS
@@ -57,10 +58,12 @@ Per request for `/tvp/<id>.ts`:
    sync). If ffmpeg can't be started, the request fails with HTTP 500.
 4. If ffmpeg stops (e.g. the signed token expires), the proxy resolves a fresh
    URL and continues on the same HTTP response, so long recordings survive
-   token rotation. If resolving fails, it retries the previous URL. After 3
-   consecutive ffmpeg runs shorter than 30 s it gives up and aborts the
+   token rotation. If resolving fails, it retries the previous URL. ffmpeg
+   gives up on upstream reads that stall for 15 s rather than hanging. After 3
+   consecutive ffmpeg runs shorter than 30 s the proxy gives up and aborts the
    response with an error, so a client can tell a failure from the end of the
-   programme. When the client disconnects, ffmpeg is killed.
+   programme. When the client disconnects, ffmpeg is killed, even if it is
+   stalled.
 
 No transcoding happens in the proxy; CPU use is negligible.
 
@@ -122,7 +125,8 @@ docker exec tvp-pl-proxy tvp-vod-proxy make-m3u 192.0.2.10:38099 > tvp.m3u
 ```
 
 Replace `192.0.2.10` with the address your IPTV client uses to reach the
-Docker host. Paid and DRM-protected channels are skipped. Channel IDs come from
+Docker host. Paid channels and any channel that fails to resolve (DRM, no HLS
+source, upstream error) are skipped and logged to stderr. Channel IDs come from
 `https://vod.tvp.pl/api/products/lives` (e.g. TVP Kultura = `399700`).
 
 ### Jellyfin
@@ -141,13 +145,17 @@ NVENC, …) this is cheap.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MAX_BITRATE` | `0` (no limit) | Highest average variant bitrate to select, bit/s. `0` → always the top variant (1080p50, ~6.8 Mbit/s today); `4000000` → 576p. |
+| `MAX_BITRATE` | `0` (no limit) | Highest average variant bitrate to select, bit/s. `0` → always the top variant (1080p50, ~6.8 Mbit/s today); `4000000` → 576p. If no variant fits, the lowest is used. |
 | `MAX_STREAMS` | `10` | Maximum concurrent streams; further requests get HTTP 503. `0` → no limit. |
 | `BIND` | `0.0.0.0` | Listen address. Keep the default in Docker and restrict the published port in `docker-compose.yml` instead. |
 | `PORT` | `8080` | Listen port inside the container. |
 | `FFMPEG` | `ffmpeg` | ffmpeg binary. |
-| `TVP_API` | `https://vod.tvp.pl` | API base URL. |
+| `TVP_API` | `https://vod.tvp.pl` | API base URL (a path prefix is kept). |
 | `RUST_LOG` | `info` | Log filter, e.g. `debug`. |
+
+`GET /healthz` returns `ok` while the proxy is running; the image's
+`HEALTHCHECK` uses it. The sample compose file additionally checks that TVP is
+reachable through the tunnel.
 
 Live HLS arrives in real time, so the selected variant's average bitrate must
 fit in the sustained throughput from Poland. If playback stutters, set
@@ -165,9 +173,9 @@ fit in the sustained throughput from Poland. If playback stutters, set
 ## Development
 
 ```sh
-cargo test                        # unit + integration tests (streaming tests need ffmpeg/ffprobe on PATH)
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
+cargo test --locked               # unit + integration tests (streaming ones need ffmpeg/ffprobe on PATH)
+cargo clippy --all-targets --locked -- -D warnings
+cargo fmt --all --check
 cargo run -- serve                # needs a Polish IP to reach TVP
 ```
 
@@ -175,14 +183,17 @@ The integration tests generate a small TVP-like HLS stream (two fMP4 video
 variants and a separate audio rendition) with ffmpeg, serve it from a mock
 TVP API/CDN, and check the proxy's output: one video + one audio track,
 variant selection, DRM → 415, API errors → 502, and that ffmpeg is stopped
-when the client disconnects. Without real ffmpeg they also check start failures
-(500), that the response is aborted when ffmpeg keeps failing or can't be
-restarted, the stream limit (503) and shutdown. No test talks to the real TVP.
-Without ffmpeg/ffprobe the streaming tests are skipped, unless `CI` is set, in
-which case they fail.
+(and not restarted) when the client disconnects, even while ffmpeg is stalled.
+Restart-loop tests use a shell script in place of ffmpeg: each restart
+re-resolves the URL (keeping the old one if that fails), three quick failures
+in a row end the stream, and a long run resets the count. Without real ffmpeg
+they also check start failures (500), that the response is aborted when ffmpeg
+keeps failing or can't be restarted, the stream limit (503) and shutdown.
+No test talks to the real TVP. Without ffmpeg/ffprobe the streaming tests are
+skipped, unless `CI` is set, in which case they fail.
 
-CI runs formatting, clippy, tests, `cargo-deny` and a Docker build on every
-push and pull request. Pushing a `v*` tag publishes a multi-arch image to GHCR.
+CI runs formatting, clippy, tests, `cargo-deny` and a Docker build on pull
+requests and pushes to `main`. Pushing a `v*` tag publishes a multi-arch image to GHCR.
 
 ## Limitations
 
