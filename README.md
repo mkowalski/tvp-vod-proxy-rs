@@ -165,7 +165,10 @@ The integration tests generate a small TVP-like HLS stream (two fMP4 video
 variants and a separate audio rendition) with ffmpeg, serve it from a mock
 TVP API/CDN, and check the proxy's output: one video + one audio track,
 variant selection, DRM → 415, API errors → 502, and that ffmpeg is stopped
-when the client disconnects. No test talks to the real TVP.
+when the client disconnects. Restart-loop tests use a shell script in place of
+ffmpeg: each restart re-resolves the URL (keeping the old one if that fails),
+three quick failures in a row end the stream, and a long run resets the count.
+No test talks to the real TVP.
 
 CI runs formatting, clippy, tests, `cargo-deny` and a Docker build on every
 push and pull request. Pushing a `v*` tag publishes a multi-arch image to GHCR.

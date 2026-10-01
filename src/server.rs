@@ -18,8 +18,6 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_stream_shim::ReceiverStream;
 
-/// ffmpeg runs shorter than this count as a quick failure.
-const QUICK: Duration = Duration::from_secs(30);
 /// Give up after this many consecutive quick failures.
 const MAX_QUICK_FAILURES: u32 = 3;
 
@@ -29,6 +27,8 @@ pub struct AppState {
     pub ffmpeg: PathBuf,
     pub work_dir: PathBuf,
     pub retry_delay: Duration,
+    /// ffmpeg runs shorter than this count as a quick failure.
+    pub quick_failure: Duration,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -102,7 +102,11 @@ async fn pump(
             break;
         }
         let ran = started.elapsed();
-        failures = if ran < QUICK { failures + 1 } else { 0 };
+        failures = if ran < state.quick_failure {
+            failures + 1
+        } else {
+            0
+        };
         if failures >= MAX_QUICK_FAILURES {
             tracing::error!(channel, failures, "giving up after quick failures");
             break;
