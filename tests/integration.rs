@@ -122,12 +122,27 @@ fn make_hls(dir: &Path) {
 }
 
 async fn start_proxy(api: &str, max_bitrate: u64) -> SocketAddr {
+    start_proxy_with(
+        api,
+        max_bitrate,
+        PathBuf::from("ffmpeg"),
+        Duration::from_millis(10),
+    )
+    .await
+}
+
+async fn start_proxy_with(
+    api: &str,
+    max_bitrate: u64,
+    ffmpeg: PathBuf,
+    retry_delay: Duration,
+) -> SocketAddr {
     let client = tvp::Client::new(Url::parse(api).unwrap(), max_bitrate).unwrap();
     let state = server::AppState {
         client,
-        ffmpeg: PathBuf::from("ffmpeg"),
+        ffmpeg,
         work_dir: std::env::temp_dir(),
-        retry_delay: Duration::from_millis(10),
+        retry_delay,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -298,4 +313,103 @@ async fn client_disconnect_stops_ffmpeg() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("ffmpeg still running 5s after client disconnected");
+}
+
+/// Write an executable `ffmpeg` stand-in that runs `script` with /bin/sh.
+fn stub_ffmpeg(dir: &Path, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join("ffmpeg");
+    std::fs::write(&p, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p
+}
+
+/// A channel that resolves to an unencrypted media playlist.
+async fn mock_channel(mock: &MockServer, channel: u64) {
+    Mock::given(path("/cdn/live.m3u8"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("#EXTM3U\n#EXTINF:2,\ns.ts\n"))
+        .mount(mock)
+        .await;
+    api_returns(mock, channel, &format!("{}/cdn/live.m3u8", mock.uri())).await;
+}
+
+/// True if a process with this pid exists.
+fn running(pid: &str) -> bool {
+    Command::new("ps")
+        .args(["-p", pid])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+#[tokio::test]
+async fn client_disconnect_stops_stalled_ffmpeg() {
+    // Emits once, then hangs without output like ffmpeg on a stalled upstream:
+    // the disconnect must be noticed even though no more data arrives.
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("pid");
+    let ffmpeg = stub_ffmpeg(
+        dir.path(),
+        &format!(
+            "echo $$ > '{}'\nprintf X\nexec sleep 1000",
+            pid_file.display()
+        ),
+    );
+    let mock = MockServer::start().await;
+    mock_channel(&mock, 8).await;
+    let addr = start_proxy_with(&mock.uri(), 0, ffmpeg, Duration::from_millis(10)).await;
+
+    let mut resp = reqwest::get(format!("http://{addr}/tvp/8.ts"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.chunk().await.unwrap().is_some(), "got data");
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    let pid = pid.trim();
+    assert!(running(pid), "ffmpeg running while streaming");
+
+    drop(resp);
+    for _ in 0..50 {
+        if !running(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("stalled ffmpeg still running 5s after client disconnected");
+}
+
+#[tokio::test]
+async fn client_disconnect_during_retry_does_not_restart_ffmpeg() {
+    // ffmpeg exits at once, so the proxy waits `retry_delay` and re-resolves;
+    // a client that leaves meanwhile must not get a fresh ffmpeg.
+    let dir = tempfile::tempdir().unwrap();
+    let runs = dir.path().join("runs");
+    let ffmpeg = stub_ffmpeg(
+        dir.path(),
+        &format!("echo run >> '{}'\nprintf X", runs.display()),
+    );
+    let mock = MockServer::start().await;
+    mock_channel(&mock, 9).await;
+    let retry_delay = Duration::from_secs(1);
+    let addr = start_proxy_with(&mock.uri(), 0, ffmpeg, retry_delay).await;
+
+    let mut resp = reqwest::get(format!("http://{addr}/tvp/9.ts"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.chunk().await.unwrap().is_some(), "got data");
+    drop(resp);
+
+    tokio::time::sleep(retry_delay * 2).await;
+    let runs = std::fs::read_to_string(&runs).unwrap();
+    assert_eq!(runs.lines().count(), 1, "ffmpeg restarted for nobody");
+    let resolves = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/api/"))
+        .count();
+    assert_eq!(resolves, 1, "re-resolved for nobody");
 }
