@@ -18,13 +18,12 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use tokio_stream_shim::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 /// Give up after this many consecutive quick failures.
 const MAX_QUICK_FAILURES: u32 = 3;
 
-type Tx = mpsc::Sender<Result<Bytes, std::io::Error>>;
+type Tx = mpsc::Sender<Bytes>;
 
 /// Shared configuration for all streams.
 #[derive(Clone)]
@@ -134,7 +133,7 @@ async fn stream(State(state): State<Arc<AppState>>, Path(file): Path<String>) ->
 
     Response::builder()
         .header(header::CONTENT_TYPE, "video/mp2t")
-        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .body(Body::from_stream(LiveBody(rx)))
         .expect("valid response")
 }
 
@@ -155,18 +154,17 @@ async fn pump(
         r = restart_loop(&state, channel, selection, &master, child, &tx) => r,
         () = state.shutdown.cancelled() => Err("server shutting down"),
     };
-    if let Err(reason) = result {
-        // hyper discards response data it has not written out yet when the
-        // body fails, so let it take everything sent so far first. Not on
-        // shutdown: a client that stopped reading would hold us up forever.
+    if result.is_err() {
+        // dropping `tx` fails the response (see `LiveBody`), and hyper discards
+        // response data it has not written out yet when the body fails, so let
+        // it take everything sent so far first. Not on shutdown: a client that
+        // stopped reading would hold us up forever.
         tokio::select! {
             _ = tx.reserve_many(tx.max_capacity()) => {}
             () = state.shutdown.cancelled() => {}
         }
-        // if the channel is still full, the client isn't reading anyway
-        let _ = tx.try_send(Err(std::io::Error::other(reason)));
     }
-    tracing::info!(channel, "stream ended");
+    tracing::info!(channel, reason = result.err(), "stream ended");
 }
 
 /// Forward ffmpeg's output, and restart it with a fresh URL when it stops.
@@ -261,11 +259,7 @@ async fn forward(mut child: Child, tx: &Tx) -> bool {
             // notice a disconnect even while ffmpeg produces no output
             () = tx.closed() => break true,
         };
-        if tx
-            .send(Ok(Bytes::copy_from_slice(&buf[..n])))
-            .await
-            .is_err()
-        {
+        if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
             break true;
         }
     };
@@ -273,25 +267,23 @@ async fn forward(mut child: Child, tx: &Tx) -> bool {
     gone
 }
 
-/// Minimal adapter from an mpsc receiver to a `Stream`, avoiding an extra crate.
-mod tokio_stream_shim {
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use tokio::sync::mpsc::Receiver;
+/// The response body: the data `pump` sends, then an error once `pump` drops
+/// its sender. A live stream never ends normally: with the client still there,
+/// `pump` only stops when ffmpeg keeps failing or can't be restarted, or on
+/// shutdown, and the client must see an aborted transfer, not an end of
+/// programme.
+struct LiveBody(mpsc::Receiver<Bytes>);
 
-    pub struct ReceiverStream<T>(Receiver<T>);
-
-    impl<T> ReceiverStream<T> {
-        pub fn new(rx: Receiver<T>) -> Self {
-            Self(rx)
-        }
-    }
-
-    impl<T> futures_core::Stream for ReceiverStream<T> {
-        type Item = T;
-        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-            self.0.poll_recv(cx)
-        }
+impl futures_core::Stream for LiveBody {
+    type Item = std::io::Result<Bytes>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let aborted = || std::io::Error::other("stream aborted");
+        self.0
+            .poll_recv(cx)
+            .map(|data| Some(data.ok_or_else(aborted)))
     }
 }
 
