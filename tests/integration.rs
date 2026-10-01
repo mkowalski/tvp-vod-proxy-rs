@@ -299,3 +299,117 @@ async fn client_disconnect_stops_ffmpeg() {
     }
     panic!("ffmpeg still running 5s after client disconnected");
 }
+
+fn client(api: &str, max_bitrate: u64) -> tvp::Client {
+    tvp::Client::new(Url::parse(api).unwrap(), max_bitrate).unwrap()
+}
+
+#[tokio::test]
+async fn resolve_without_hls_source_is_no_source() {
+    let mock = MockServer::start().await;
+    Mock::given(path("/api/products/4/videos/playlist"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sources": {}})))
+        .mount(&mock)
+        .await;
+    let r = client(&mock.uri(), 0).resolve(4).await;
+    assert!(matches!(r, Err(tvp::ResolveError::NoSource)), "{r:?}");
+}
+
+#[tokio::test]
+async fn resolve_rejects_non_json_api_response() {
+    let mock = MockServer::start().await;
+    Mock::given(path("/api/products/4/videos/playlist"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>maintenance</html>"))
+        .mount(&mock)
+        .await;
+    assert!(client(&mock.uri(), 0).resolve(4).await.is_err());
+}
+
+#[tokio::test]
+async fn resolve_accepts_direct_media_playlist() {
+    let mock = MockServer::start().await;
+    Mock::given(path("/cdn/media.m3u8"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("#EXTM3U\n#EXTINF:2.0,\nseg.ts\n"))
+        .mount(&mock)
+        .await;
+    let url = format!("{}/cdn/media.m3u8", mock.uri());
+    api_returns(&mock, 5, &url).await;
+    let sel = client(&mock.uri(), 0).resolve(5).await.unwrap();
+    assert_eq!(sel.video.as_str(), url);
+    assert_eq!(sel.bitrate, 0);
+    assert_eq!(sel.audio, None);
+}
+
+#[tokio::test]
+async fn resolve_uses_redirect_target_as_base() {
+    let mock = MockServer::start().await;
+    Mock::given(path("/cdn/master.m3u8"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/token/x/master.m3u8", mock.uri())),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(path("/token/x/master.m3u8"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n"),
+        )
+        .mount(&mock)
+        .await;
+    Mock::given(path("/token/x/v.m3u8"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("#EXTM3U\n#EXTINF:2.0,\nseg.ts\n"))
+        .mount(&mock)
+        .await;
+    api_returns(&mock, 6, &format!("{}/cdn/master.m3u8", mock.uri())).await;
+    let sel = client(&mock.uri(), 0).resolve(6).await.unwrap();
+    assert_eq!(sel.video.as_str(), format!("{}/token/x/v.m3u8", mock.uri()));
+}
+
+#[tokio::test]
+async fn resolve_rejects_oversized_response() {
+    let mock = MockServer::start().await;
+    Mock::given(path("/cdn/master.m3u8"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'#'; 5 * 1024 * 1024]))
+        .mount(&mock)
+        .await;
+    api_returns(&mock, 8, &format!("{}/cdn/master.m3u8", mock.uri())).await;
+    let r = client(&mock.uri(), 0).resolve(8).await;
+    assert!(matches!(r, Err(tvp::ResolveError::TooLarge)), "{r:?}");
+}
+
+#[tokio::test]
+async fn api_base_path_prefix_is_kept_without_trailing_slash() {
+    let mock = MockServer::start().await;
+    Mock::given(path("/prefix/api/products/lives"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [
+                {"id": 1, "title": "A", "payable": true, "images": {}},
+                {"id": 2, "title": "B"}
+            ]
+        })))
+        .mount(&mock)
+        .await;
+    let lives = client(&format!("{}/prefix", mock.uri()), 0)
+        .lives()
+        .await
+        .unwrap();
+    let got: Vec<_> = lives.iter().map(|l| (l.id, l.payable)).collect();
+    assert_eq!(got, vec![(1, true), (2, false)]);
+}
+
+#[tokio::test]
+async fn upstream_error_body_does_not_leak_details() {
+    let mock = MockServer::start().await;
+    Mock::given(path("/api/products/9/videos/playlist"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&mock)
+        .await;
+    let addr = start_proxy(&mock.uri(), 0).await;
+    let r = reqwest::get(format!("http://{addr}/tvp/9.ts"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502);
+    let body = r.text().await.unwrap();
+    assert!(!body.contains(&mock.uri()), "{body}");
+}
