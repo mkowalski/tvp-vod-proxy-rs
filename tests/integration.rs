@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -539,6 +540,61 @@ async fn client_disconnect_during_retry_does_not_restart_ffmpeg() {
     assert_eq!(resolves, 1, "re-resolved for nobody");
 }
 
+#[tokio::test]
+async fn client_disconnect_during_re_resolve_releases_stream() {
+    let (_dir, ffmpeg) = stub_ffmpeg(&format!(r#"echo run >> "$0.runs"; {PRINT_MASTER}"#));
+    let runs = ffmpeg.with_extension("runs");
+    let mock = MockServer::start().await;
+    serve_media(&mock).await;
+    api_playlist(24, &format!("{}/cdn/live.m3u8", mock.uri()))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let resolving = Arc::new(AtomicBool::new(false));
+    let started = resolving.clone();
+    Mock::given(path("/api/products/24/videos/playlist"))
+        .respond_with(move |_: &wiremock::Request| {
+            started.store(true, Ordering::SeqCst);
+            ResponseTemplate::new(500).set_delay(Duration::from_secs(30))
+        })
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let streams = Arc::new(Semaphore::new(1));
+    let state = server::AppState {
+        ffmpeg,
+        streams: streams.clone(),
+        ..proxy_state(&mock.uri(), 0)
+    };
+    let shutdown = state.shutdown.clone();
+    let (addr, serving) = serve_proxy(state).await;
+
+    let mut resp = reqwest::get(format!("http://{addr}/tvp/24.ts"))
+        .await
+        .unwrap();
+    let master = stub_master_path(&mut resp).await;
+    wait_until("the second API request to start", || {
+        resolving.load(Ordering::SeqCst)
+    })
+    .await;
+
+    // Leave while the API request is pending, not during the retry sleep.
+    // Cleanup must not wait for the upstream response or its 20 s timeout.
+    drop(resp);
+    wait_until("the master playlist to be removed", || !master.exists()).await;
+    wait_until("the slot to be freed", || streams.available_permits() == 1).await;
+    assert_eq!(std::fs::read_to_string(runs).unwrap().lines().count(), 1);
+    mock.verify().await;
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("server stopped")
+        .unwrap()
+        .unwrap();
+}
+
 /// The first line of a stream, where a stub ffmpeg printed its `-i` path.
 async fn stub_master_path(resp: &mut reqwest::Response) -> PathBuf {
     assert_eq!(resp.status(), 200);
@@ -557,11 +613,29 @@ async fn stub_master_path(resp: &mut reqwest::Response) -> PathBuf {
 
 #[tokio::test]
 async fn concurrent_streams_of_a_channel_use_separate_playlists() {
-    // Prints the master playlist path it was given, then stays up.
-    let (_dir, ffmpeg) = stub_ffmpeg(&format!("{PRINT_MASTER}; exec sleep 1000"));
+    // Prints the master path, then waits until that stream is told to restart.
+    let (_dir, ffmpeg) = stub_ffmpeg(&format!(
+        r#"{PRINT_MASTER}
+        while [ "$1" != -i ]; do shift; done
+        while :; do
+            if [ "$(cat "$0.restart" 2>/dev/null)" = "$2" ]; then
+                rm -- "$0.restart"
+                exit 1
+            fi
+            sleep 0.1
+        done"#
+    ));
+    let restart = ffmpeg.with_extension("restart");
     let mock = MockServer::start().await;
     serve_media(&mock).await;
-    api_returns(&mock, 12, &format!("{}/cdn/live.m3u8", mock.uri())).await;
+    let old = format!("{}/cdn/live.m3u8", mock.uri());
+    let new = format!("{}/cdn/refreshed.m3u8", mock.uri());
+    api_playlist(12, &old)
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&mock)
+        .await;
+    api_playlist(12, &new).expect(1).mount(&mock).await;
     let (addr, _) = serve_proxy(server::AppState {
         ffmpeg,
         ..proxy_state(&mock.uri(), 0)
@@ -584,6 +658,14 @@ async fn concurrent_streams_of_a_channel_use_separate_playlists() {
         assert_eq!(mode & 0o777, 0o600, "{m:?}");
     }
 
+    let original_b = std::fs::read_to_string(&master_b).unwrap();
+    assert_eq!(original_b.lines().last(), Some(old.as_str()));
+    std::fs::write(restart, master_a.to_str().unwrap()).unwrap();
+    assert_eq!(stub_master_path(&mut a).await, master_a);
+    let refreshed_a = std::fs::read_to_string(&master_a).unwrap();
+    assert_eq!(refreshed_a.lines().last(), Some(new.as_str()));
+    assert_eq!(std::fs::read_to_string(&master_b).unwrap(), original_b);
+
     // A ending removes its own playlist, not the one B's ffmpeg is reading
     drop(a);
     wait_until("A's playlist to be removed", || !master_a.exists()).await;
@@ -591,6 +673,7 @@ async fn concurrent_streams_of_a_channel_use_separate_playlists() {
 
     drop(b);
     wait_until("B's playlist to be removed", || !master_b.exists()).await;
+    mock.verify().await;
 }
 
 /// Stub that prints the variant URL from the master playlist it reads, then fails.
