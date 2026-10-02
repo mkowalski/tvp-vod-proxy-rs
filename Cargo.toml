@@ -1,6 +1,6 @@
 [package]
 name = "tvp-vod-proxy"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 description = "Serve TVP live channels as stable MPEG-TS URLs for IPTV clients"
 license = "MIT OR Apache-2.0"
