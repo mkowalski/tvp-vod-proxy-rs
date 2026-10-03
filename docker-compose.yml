@@ -8,7 +8,15 @@
 #   docker exec tvp-pl-proxy tvp-vod-proxy make-m3u <docker-host>:38099 > tvp.m3u
 services:
   wg:
-    image: lscr.io/linuxserver/wireguard:1.0.20260223-r0-ls123   # runs with NET_ADMIN: pin it
+    image: lscr.io/linuxserver/wireguard:1.0.20260223-r0-ls124   # runs with NET_ADMIN: pin it
+    labels:
+      # The proxy lives in this container's network namespace. If anything
+      # other than `docker compose up` recreates wg (Watchtower, ...), the
+      # proxy is left behind in the old, dead namespace: it keeps running and
+      # its loopback healthcheck keeps passing, while port 38099 now leads to
+      # the new namespace, where nothing listens. Update both with
+      # `docker compose pull && docker compose up -d`.
+      com.centurylinklabs.watchtower.enable: "false"
     container_name: tvp-pl-wg
     cap_add: [NET_ADMIN]
     sysctls:
@@ -53,6 +61,7 @@ services:
     depends_on:
       wg:
         condition: service_healthy
+        restart: true                # wg recreated by compose => proxy too
     restart: unless-stopped
 
 networks:

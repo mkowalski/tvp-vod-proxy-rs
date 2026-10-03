@@ -119,6 +119,16 @@ stream going through it, including DVR recordings in progress, and Jellyfin
 does not reconnect. The sample compose pins a version and opts out of
 Watchtower; update by changing the tag when nothing is recording.
 
+**Never let anything recreate `wg` on its own.** The proxy runs inside the
+`wg` container's network namespace. If `wg` is recreated by something other
+than `docker compose up` (Watchtower, `docker compose up --no-deps wg`), the
+proxy is left behind in the old, dead namespace: it keeps running and its
+loopback healthcheck keeps passing, but port 38099 now leads to the new
+namespace, where nothing listens, and clients get "connection refused". The
+sample compose therefore pins `wg` and opts it out of Watchtower as well.
+Update both with `docker compose pull && docker compose up -d` when nothing
+is recording; it recreates `wg` and the proxy together.
+
 ### Generate the channel list
 
 ```sh
@@ -170,6 +180,12 @@ fit in the sustained throughput from Poland. If playback stutters, set
   It must match the `gateway` in `docker-compose.yml`.
 - The `wg` healthcheck fails if the exit country isn't `PL`; `proxy` only
   starts once it is healthy.
+- `proxy` shares `wg`'s network namespace (`network_mode: service:wg`), so
+  `wg` must never be recreated without the proxy (see above). `depends_on`
+  sets `restart: true` so Compose restarts the proxy whenever it recreates
+  `wg`. Note that current Compose (v5) recreates the proxy on every
+  `docker compose up -d` in this directory, even with no changes: its config
+  hash includes the `wg` container ID.
 
 ## Development
 
