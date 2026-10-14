@@ -1,4 +1,4 @@
-FROM rust:1.98-alpine3.24 AS build
+FROM rust:1.99-alpine3.24 AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 # cache dependencies separately from the source
