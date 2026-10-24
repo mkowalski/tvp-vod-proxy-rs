@@ -91,7 +91,7 @@ cd tvp-vod-proxy-rs
 # 1. WireGuard client config
 mkdir -p wireguard/wg_confs
 ( umask 077; wg genkey | tee wireguard/privatekey | wg pubkey > wireguard/publickey )
-cp wireguard/wg0.conf.example wireguard/wg_confs/wg0.conf
+cp examples/wg0.conf.example wireguard/wg_confs/wg0.conf
 chmod 600 wireguard/wg_confs/wg0.conf
 #   - put the private key into wg0.conf
 #   - add wireguard/publickey as a peer on your server in Poland

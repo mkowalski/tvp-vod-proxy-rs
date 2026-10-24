@@ -1,4 +1,3 @@
 /target
 wireguard/*
-!wireguard/wg0.conf.example
 *.m3u
