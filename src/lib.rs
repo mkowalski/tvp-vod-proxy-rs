@@ -2,5 +2,6 @@
 
 pub mod hls;
 pub mod m3u;
+pub mod metrics;
 pub mod server;
 pub mod tvp;

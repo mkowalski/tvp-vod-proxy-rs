@@ -172,6 +172,89 @@ Live HLS arrives in real time, so the selected variant's average bitrate must
 fit in the sustained throughput from Poland. If playback stutters, set
 `MAX_BITRATE` below your tunnel's throughput.
 
+## Metrics
+
+`GET /metrics` exposes Prometheus text metrics on the proxy's existing port.
+With the sample Compose port mapping:
+
+```sh
+curl http://localhost:38099/metrics
+```
+
+Collection is entirely within the proxy. Scraping reads counters and gauges;
+it does not contact TVP or start a stream. Counters and histograms accumulate
+since startup and reset when the proxy restarts. `tvp_process_start_time_seconds`
+identifies a new run.
+
+### Telegraf
+
+Add the input from [examples/telegraf.conf](examples/telegraf.conf) to your
+Telegraf configuration and replace the example address with the proxy's Docker
+host address as reachable **from Telegraf**:
+
+```toml
+[[inputs.prometheus]]
+  urls = ["http://192.0.2.10:38099/metrics"]
+  interval = "10s"
+  metric_version = 2
+  name_override = "tvp_proxy"
+```
+
+Use your existing InfluxDB output configuration. `metric_version = 2` stores
+metric names as fields and labels as tags in the `tvp_proxy` measurement.
+For availability, alert on missing `tvp_process_uptime_seconds` samples: an
+unreachable proxy produces no new samples. See the
+[Telegraf Prometheus input documentation](https://docs.influxdata.com/telegraf/v1/input-plugins/prometheus/).
+
+### Metric reference
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `tvp_stream_requests_total` | Counter | `outcome` | Valid channel requests classified at startup: `started`, `drm`, `resolve_error`, `capacity`, `playlist_error`, `ffmpeg_error`, `cancelled`. |
+| `tvp_stream_requests_in_flight` | Gauge | — | Requests still resolving or starting ffmpeg. |
+| `tvp_streams_active` | Gauge | `channel` | Connections whose first ffmpeg started and whose streaming task is still running, including recovery and draining. |
+| `tvp_stream_seconds_total` | Counter | `channel` | Summed connection duration, including ongoing streams and recovery. Two simultaneous one-hour streams contribute 7,200 seconds. |
+| `tvp_stream_bytes_total` | Counter | `channel` | MPEG-TS payload bytes handed to the HTTP layer. |
+| `tvp_stream_ends_total` | Counter | `reason` | Ended connections: `client_disconnect`, `shutdown`, `quick_failures`, `restart_error`, `cancelled`. |
+| `tvp_ffmpeg_processes_active` | Gauge | `channel` | ffmpeg children currently owned by the proxy. |
+| `tvp_ffmpeg_restarts_total` | Counter | — | Successfully spawned replacement ffmpeg processes, excluding the initial start. |
+| `tvp_resolve_total` | Counter | `phase`, `outcome` | Resolution attempts, including failed and cancelled attempts. Phases are `initial` and `retry`. |
+| `tvp_resolves_in_flight` | Gauge | `phase` | Resolutions currently pending. |
+| `tvp_resolve_duration_seconds` | Histogram | `phase` | Resolution latency, including failures/cancellation and excluding retry sleep. |
+| `tvp_stream_startup_seconds` | Histogram | — | Time from request arrival to the first nonempty HTTP body chunk; observed once, only if output appears. |
+| `tvp_stream_limit` | Gauge | — | Effective stream capacity; `0` means unlimited. |
+| `tvp_stream_slots_in_use` | Gauge | — | Occupied capacity, including ffmpeg startup before a connection becomes active. |
+| `tvp_process_start_time_seconds` | Gauge | — | Server initialization time as Unix seconds. |
+| `tvp_process_uptime_seconds` | Gauge | — | Seconds since server initialization. |
+| `tvp_build_info` | Gauge | `version` | Package version, with a value of `1`. |
+
+Resolution outcomes are `ok`, `drm`, `no_source`, `no_variant`, `json`,
+`http_403`, `http_error` (other failing HTTP statuses), `timeout`, `connect`,
+`upstream` (other transport errors), `url`, `too_large`, and `cancelled`.
+An initial resolution happens before checking capacity, so a request rejected
+with 503 still contributes a resolution attempt.
+
+Histograms export cumulative `_bucket`, `_sum` and `_count` series. Bucket
+upper bounds, in seconds, are `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`,
+`20`, `40`, `80`, and `+Inf`; bucket series add the `le` label. Use bucket
+increments over the desired time window to calculate latency percentiles.
+
+Fixed outcome counters and histograms are emitted at zero from startup, so
+short connections between scrapes are counted. Per-channel series appear when
+a resolved channel is admitted and remain present, including zero active
+connections. There are at most 128 distinct channel IDs plus `channel="other"`,
+which accumulates additional IDs. Requests that fail resolution or find capacity
+full do not allocate channel series. Labels contain IDs and fixed categories;
+client addresses, user agents and upstream URLs are not exported.
+
+For charts, use reset-aware counter increases/rates: byte rate × 8 gives output
+bit/s, and an increase in streaming seconds ÷ 3,600 gives connection-hours.
+The first sample of a new per-channel series establishes its baseline.
+Connections include player probes, viewing and recordings; they are not a count
+of people. HTTP 200 only means ffmpeg started, and output bytes do not prove
+client receipt or playback or measure WireGuard traffic. Internal ffmpeg restarts
+remain part of the same connection.
+
 ## Networking notes
 
 - `AllowedIPs = 0.0.0.0/0` applies only inside the stack's namespace.

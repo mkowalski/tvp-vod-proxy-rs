@@ -80,6 +80,7 @@ async fn serve(client: tvp::Client) -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     let state = server::AppState {
         client,
+        metrics: Arc::default(),
         ffmpeg: PathBuf::from(env("FFMPEG", "ffmpeg".to_string())?),
         work_dir: std::env::temp_dir(),
         retry_delay: Duration::from_secs(1),
