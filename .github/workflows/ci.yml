@@ -38,7 +38,12 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
@@ -48,6 +53,17 @@ jobs:
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: cargo test --locked
+        env:
+          CI: "true"
+
+  release-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s tests/release -v
 
   deny:
     runs-on: ubuntu-latest
@@ -56,19 +72,33 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
 
   docker:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
+          platforms: ${{ matrix.platform }}
           push: false
           load: true
           tags: tvp-vod-proxy:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - name: Smoke test image
+          cache-from: type=gha,scope=ci-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=ci-${{ matrix.arch }}
+      - name: Native architecture, codec and isolated metadata smoke
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
-          docker run --rm tvp-vod-proxy:ci --help
-          docker run --rm --entrypoint ffmpeg tvp-vod-proxy:ci -version | head -1
+          image_id="$(docker image inspect tvp-vod-proxy:ci --format '{{.Id}}')"
+          python3 scripts/release_image.py --image "$image_id" --arch "$ARCH" --kind tvp --output "image-smoke-$ARCH.json"

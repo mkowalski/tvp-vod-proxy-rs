@@ -1,5 +1,7 @@
 # tvp-vod-proxy-rs
 
+[Versioned multi-architecture releases and deployment boundary](docs/releasing.md)
+
 [![CI](https://github.com/mkowalski/tvp-vod-proxy-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mkowalski/tvp-vod-proxy-rs/actions/workflows/ci.yml)
 
 Watch and record the free live channels of Polish public TV (TVP) in
