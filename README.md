@@ -41,7 +41,7 @@ sequenceDiagram
     P->>C: fetch playlist and segments
     C-->>P: HLS video + audio
     P-->>J: one MPEG-TS stream
-    Note over P,C: token expires: proxy gets a new URL and keeps streaming
+    Note over P,C: fatal upstream exit aborts this response; no reset timeline is appended
 ```
 
 Per request for `/tvp/<id>.ts`:
@@ -55,15 +55,23 @@ Per request for `/tvp/<id>.ts`:
 3. It writes a one-variant master playlist and runs `ffmpeg -c copy` on it,
    streaming MPEG-TS to the client. Reading video and audio as **one** HLS
    input keeps them on a single timeline (separate inputs drift out of A/V
-   sync). If ffmpeg can't be started, the request fails with HTTP 500.
-4. If ffmpeg stops (e.g. the signed token expires), the proxy resolves a fresh
-   URL and continues on the same HTTP response, so long recordings survive
-   token rotation. If resolving fails, it retries the previous URL. ffmpeg
-   gives up on upstream reads that stall for 15 s rather than hanging. After 3
-   consecutive ffmpeg runs shorter than 30 s the proxy gives up and aborts the
-   response with an error, so a client can tell a failure from the end of the
-   programme. When the client disconnects, ffmpeg is killed, even if it is
-   stalled.
+   sync). Video and audio are mandatory; HTTP200 waits for payload from both.
+   If ffmpeg can't start, the request fails with500; unusable output fails502.
+   Overall startup is bounded to120seconds (504) and bootstrap media to2MiB.
+4. If ffmpeg stops (including token expiry or a clean upstream EOF), the proxy
+   aborts that response. It does **not** start another ffmpeg and concatenate a
+   reset clock or replayed media. A new HTTP request resolves a fresh URL.
+   This replaces the previous transparent token-refresh behavior: Jellyfin
+   recordings can stop on fatal upstream failure; automatic resumption is not
+   promised. ffmpeg's upstream read timeout remains15seconds. After startup,
+   30seconds without either required track ends the session. Queued media is
+   bounded to2MiB; a client blocking output for30seconds has its owned HTTP/1
+   connection reset and child reaped. Disconnect/shutdown cancels startup and
+   streaming without affecting other clients.
+
+`HEAD /tvp/<id>.ts` returns metadata for a syntactically valid numeric route
+without resolving the channel, taking a slot or starting ffmpeg. It does not
+claim the channel is currently playable or advertise a zero-length GET.
 
 No transcoding happens in the proxy; CPU use is negligible.
 
@@ -212,13 +220,13 @@ unreachable proxy produces no new samples. See the
 |---|---|---|---|
 | `tvp_stream_requests_total` | Counter | `outcome` | Valid channel requests classified at startup: `started`, `drm`, `resolve_error`, `capacity`, `playlist_error`, `ffmpeg_error`, `cancelled`. |
 | `tvp_stream_requests_in_flight` | Gauge | — | Requests still resolving or starting ffmpeg. |
-| `tvp_streams_active` | Gauge | `channel` | Connections whose first ffmpeg started and whose streaming task is still running, including recovery and draining. |
-| `tvp_stream_seconds_total` | Counter | `channel` | Summed connection duration, including ongoing streams and recovery. Two simultaneous one-hour streams contribute 7,200 seconds. |
+| `tvp_streams_active` | Gauge | `channel` | Admitted connections including A/V bootstrap and bounded output draining. |
+| `tvp_stream_seconds_total` | Counter | `channel` | Summed connection duration, including ongoing streams and bootstrap. Two simultaneous one-hour streams contribute 7,200 seconds. |
 | `tvp_stream_bytes_total` | Counter | `channel` | MPEG-TS payload bytes handed to the HTTP layer. |
-| `tvp_stream_ends_total` | Counter | `reason` | Ended connections: `client_disconnect`, `shutdown`, `quick_failures`, `restart_error`, `cancelled`. |
+| `tvp_stream_ends_total` | Counter | `reason` | Ended connections: `client_disconnect`, `shutdown`, `upstream_exit`, `media_timeout`, `downstream_timeout`, `cancelled`. Legacy `quick_failures`/`restart_error` remain zero. |
 | `tvp_ffmpeg_processes_active` | Gauge | `channel` | ffmpeg children currently owned by the proxy. |
-| `tvp_ffmpeg_restarts_total` | Counter | — | Successfully spawned replacement ffmpeg processes, excluding the initial start. |
-| `tvp_resolve_total` | Counter | `phase`, `outcome` | Resolution attempts, including failed and cancelled attempts. Phases are `initial` and `retry`. |
+| `tvp_ffmpeg_restarts_total` | Counter | — | Legacy compatibility series, always zero: established streams are not restarted. |
+| `tvp_resolve_total` | Counter | `phase`, `outcome` | Resolution attempts including failures/cancellation. `initial` is active; legacy `retry` remains zero. |
 | `tvp_resolves_in_flight` | Gauge | `phase` | Resolutions currently pending. |
 | `tvp_resolve_duration_seconds` | Histogram | `phase` | Resolution latency, including failures/cancellation and excluding retry sleep. |
 | `tvp_stream_startup_seconds` | Histogram | — | Time from request arrival to the first nonempty HTTP body chunk; observed once, only if output appears. |
@@ -251,9 +259,10 @@ For charts, use reset-aware counter increases/rates: byte rate × 8 gives output
 bit/s, and an increase in streaming seconds ÷ 3,600 gives connection-hours.
 The first sample of a new per-channel series establishes its baseline.
 Connections include player probes, viewing and recordings; they are not a count
-of people. HTTP 200 only means ffmpeg started, and output bytes do not prove
-client receipt or playback or measure WireGuard traffic. Internal ffmpeg restarts
-remain part of the same connection.
+of people. HTTP200 means both required MPEG-TS payload PIDs were observed, not
+that codecs decoded or A/V synchronization is correct. Output bytes do not prove
+client receipt or playback or measure WireGuard traffic. Startup timeouts count
+as cancelled pending requests; missing-track bootstrap failures as `ffmpeg_error`.
 
 ## Networking notes
 
@@ -284,11 +293,12 @@ variants and a separate audio rendition) with ffmpeg, serve it from a mock
 TVP API/CDN, and check the proxy's output: one video + one audio track,
 variant selection, DRM → 415, API errors → 502, and that ffmpeg is stopped
 (and not restarted) when the client disconnects, even while ffmpeg is stalled.
-Restart-loop tests use a shell script in place of ffmpeg: each restart
-re-resolves the URL (keeping the old one if that fails), three quick failures
-in a row end the stream, and a long run resets the count. Without real ffmpeg
-they also check start failures (500), that the response is aborted when ffmpeg
-keeps failing or can't be restarted, the stream limit (503) and shutdown.
+Real media regressions require exactly one six-second pass, monotonic DTS on
+both tracks and a full strict decode, rather than accepting replayed passes.
+Synthetic transport-packet subprocesses exercise no-respawn on exit, bootstrap
+deadlines/missing tracks, one-track silence, private playlists, capacity,
+disconnect/shutdown and unread-client resets without draining their sockets.
+They test lifecycle/activity only, not codec validity.
 No test talks to the real TVP. Without ffmpeg/ffprobe the streaming tests are
 skipped, unless `CI` is set, in which case they fail.
 
@@ -302,6 +312,12 @@ requests and pushes to `main`. Pushing a `v*` tag publishes a multi-arch image t
 - One ffmpeg process and one upstream connection per active viewer/recording;
   all of it goes through your Polish uplink (~7 Mbit/s per 1080p channel).
 - TVP may change its API at any time.
+- Native regression checks do not certify a Linux image or actual Jellyfin DVR
+  artifacts. This source change has not been deployed; no live server, WG, TVP
+  or Jellyfin restart was performed while recording safety is active.
+
+See the [recording-safety checkpoint](docs/acceptance/2026-10-25-recording-safety.md)
+for verified regressions, review results and pending deployment/DVR gates.
 
 ## Legal notice
 

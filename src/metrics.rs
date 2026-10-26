@@ -21,12 +21,15 @@ const REQUEST_OUTCOMES: [&str; 7] = [
     "ffmpeg_error",
     "cancelled",
 ];
-const END_REASONS: [&str; 5] = [
+const END_REASONS: [&str; 8] = [
     "client_disconnect",
     "shutdown",
     "quick_failures",
     "restart_error",
     "cancelled",
+    "downstream_timeout",
+    "upstream_exit",
+    "media_timeout",
 ];
 const PHASES: [&str; 2] = ["initial", "retry"];
 const RESOLVE_OUTCOMES: [&str; 13] = [
@@ -185,7 +188,7 @@ impl Metrics {
             &mut out,
             "tvp_streams_active",
             "gauge",
-            "Admitted stream connections, including recovery and output draining.",
+            "Admitted stream connections, including bootstrap and output draining.",
         );
         for (id, c) in &channels {
             let active = c.activity.lock().expect("metrics activity poisoned").active;
@@ -200,7 +203,7 @@ impl Metrics {
             &mut out,
             "tvp_stream_seconds_total",
             "counter",
-            "Cumulative connection seconds, including ongoing streams and recovery.",
+            "Cumulative connection seconds, including ongoing streams and bootstrap.",
         );
         for (id, c) in &channels {
             let seconds = c
@@ -366,10 +369,6 @@ impl ChannelMetrics {
         ProcessGuard(self.clone())
     }
 
-    pub(crate) fn restarted(&self) {
-        self.totals.restarts.fetch_add(1, Relaxed);
-    }
-
     pub(crate) fn output(&self, bytes: usize, first: Option<Duration>) {
         self.bytes.fetch_add(bytes as u64, Relaxed);
         if let Some(duration) = first {
@@ -416,7 +415,6 @@ impl Drop for RequestGuard {
 #[derive(Clone, Copy)]
 pub(crate) enum ResolvePhase {
     Initial,
-    Retry,
 }
 
 pub(crate) struct ResolveGuard {
@@ -469,9 +467,11 @@ impl Drop for ResolveGuard {
 pub(crate) enum EndReason {
     ClientDisconnect,
     Shutdown,
-    QuickFailures,
-    RestartError,
-    Cancelled,
+    // Preserve zero-valued legacy quick_failures/restart_error series.
+    Cancelled = 4,
+    DownstreamTimeout,
+    UpstreamExit,
+    MediaTimeout,
 }
 
 impl EndReason {
@@ -479,9 +479,10 @@ impl EndReason {
         match self {
             Self::ClientDisconnect => "client disconnected",
             Self::Shutdown => "server shutting down",
-            Self::QuickFailures => "ffmpeg keeps failing",
-            Self::RestartError => "cannot restart ffmpeg",
             Self::Cancelled => "stream task cancelled",
+            Self::DownstreamTimeout => "client stopped accepting output",
+            Self::UpstreamExit => "upstream media process ended",
+            Self::MediaTimeout => "required media track stopped",
         }
     }
 }
@@ -494,10 +495,6 @@ pub(crate) struct StreamGuard {
 }
 
 impl StreamGuard {
-    pub(crate) fn metrics(&self) -> &Arc<ChannelMetrics> {
-        &self.metrics
-    }
-
     pub(crate) fn finish(mut self, reason: EndReason) {
         self.reason = reason;
     }

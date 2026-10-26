@@ -151,12 +151,13 @@ fn proxy_state(api: &str, max_bitrate: u64) -> server::AppState {
         metrics: Arc::default(),
         ffmpeg: PathBuf::from("ffmpeg"),
         work_dir: std::env::temp_dir(),
-        retry_delay: Duration::from_millis(10),
-        quick_failure: Duration::from_secs(30),
         streams: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
         shutdown: CancellationToken::new(),
         // longer than any test waits: shutdown must complete without it
         shutdown_grace: Duration::from_secs(60),
+        downstream_timeout: Duration::from_secs(30),
+        startup_timeout: Duration::from_secs(120),
+        media_timeout: Duration::from_secs(30),
     }
 }
 
@@ -196,6 +197,45 @@ async fn probe(url: &str) -> (Vec<String>, u64) {
     .expect("stream finished");
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), &bytes).unwrap();
+    let decode = Command::new("ffmpeg")
+        .args(["-hide_banner", "-v", "error", "-xerror", "-i"])
+        .arg(tmp.path())
+        .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
+        .output()
+        .unwrap();
+    assert!(
+        decode.status.success() && decode.stderr.is_empty(),
+        "complete recording must decode: {}",
+        String::from_utf8_lossy(&decode.stderr)
+    );
+    for track in ["v:0", "a:0"] {
+        let clock = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                track,
+                "-show_packets",
+                "-show_entries",
+                "packet=dts",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        assert!(clock.status.success());
+        let ticks: Vec<i64> = String::from_utf8(clock.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split(',').next()?.parse().ok())
+            .collect();
+        assert!(ticks.len() > 100, "missing track packets");
+        assert!(
+            ticks.windows(2).all(|p| p[1] >= p[0]),
+            "{track} contains a reset clock"
+        );
+    }
     let out = Command::new("ffprobe")
         .args([
             "-v",
@@ -250,23 +290,20 @@ async fn streams_one_video_and_one_audio_as_mpegts() {
     let mock = MockServer::start().await;
     serve_dir(&mock, hls.path()).await;
     api_returns(&mock, 1, &format!("{}/cdn/master.m3u8", mock.uri())).await;
-    // The input is a 6 s VOD at 25 fps, so every ffmpeg run ends after one pass
-    // and counts as a quick failure: the client gets three passes back to back
-    // before the proxy gives up. (format=duration can't tell, as timestamps
-    // restart with every run.)
-    let three_passes = 3 * 6 * 25;
+    // One recording must contain one timeline, not replayed reset-clock passes.
+    let one_pass = 6 * 25;
 
     // no limit: top variant
     let addr = start_proxy(&mock.uri(), 0).await;
     let (streams, frames) = probe(&format!("http://{addr}/tvp/1.ts")).await;
     assert_eq!(streams, vec!["audio,2", "video,320"], "{streams:?}");
-    assert_eq!(frames, three_passes);
+    assert_eq!(frames, one_pass);
 
     // capped: lower variant
     let addr = start_proxy(&mock.uri(), 300_000).await;
     let (streams, frames) = probe(&format!("http://{addr}/tvp/1.ts")).await;
     assert_eq!(streams, vec!["audio,2", "video,160"], "{streams:?}");
-    assert_eq!(frames, three_passes);
+    assert_eq!(frames, one_pass);
 }
 
 #[tokio::test]
@@ -408,6 +445,398 @@ async fn unknown_paths_return_404() {
     assert_eq!(r.status(), 200);
 }
 
+#[tokio::test]
+async fn head_does_not_resolve_or_spawn() {
+    let mock = MockServer::start().await;
+    serve_media(&mock).await;
+    api_returns(&mock, 40, &format!("{}/cdn/live.m3u8", mock.uri())).await;
+    let (_dir, ffmpeg) = stub_ffmpeg("echo run >> \"$0.runs\"; exec sleep 1000");
+    let runs = ffmpeg.with_extension("runs");
+    let state = server::AppState {
+        ffmpeg,
+        ..proxy_state(&mock.uri(), 0)
+    };
+    let stop = state.shutdown.clone();
+    let slots = state.streams.clone();
+    let before = slots.available_permits();
+    let (addr, serving) = serve_proxy(state).await;
+    let r = reqwest::Client::new()
+        .head(format!("http://{addr}/tvp/40.ts"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "video/mp2t");
+    assert!(!r.headers().contains_key("content-length"));
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "HEAD contacted upstream"
+    );
+    assert!(!runs.exists());
+    assert_eq!(slots.available_permits(), before);
+    assert_eq!(
+        reqwest::Client::new()
+            .head(format!("http://{addr}/tvp/bad.ts"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    stop.cancel();
+    serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn missing_tracks_cannot_start_a_successful_tv_stream() {
+    let mock = MockServer::start().await;
+    serve_media(&mock).await;
+    api_returns(&mock, 42, &format!("{}/cdn/live.m3u8", mock.uri())).await;
+    for script in [
+        "exit 0",
+        "printf '\\107\\101\\000\\020'; printf '%0184d' 0",
+        "printf '\\107\\101\\001\\020'; printf '%0184d' 0",
+    ] {
+        let (_dir, ffmpeg) = stub_ffmpeg(script);
+        let state = server::AppState {
+            ffmpeg,
+            ..proxy_state(&mock.uri(), 0)
+        };
+        let stop = state.shutdown.clone();
+        let (addr, serving) = serve_proxy(state).await;
+        let r = reqwest::get(format!("http://{addr}/tvp/42.ts"))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            502,
+            "incomplete A/V input cannot commit HTTP200"
+        );
+        stop.cancel();
+        serving.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn audio_activity_cannot_hide_a_stalled_video_track() {
+    let mock = MockServer::start().await;
+    serve_media(&mock).await;
+    api_returns(&mock, 43, &format!("{}/cdn/live.m3u8", mock.uri())).await;
+    let (_dir, ffmpeg) = stub_ffmpeg(
+        "printf '\\107\\101\\000\\020'; printf '%0184d' 0; while :; do printf '\\107\\101\\001\\020'; printf '%0184d' 0; sleep 0.01; done",
+    );
+    let state = server::AppState {
+        ffmpeg,
+        media_timeout: Duration::from_secs(1),
+        ..proxy_state(&mock.uri(), 0)
+    };
+    let stop = state.shutdown.clone();
+    let (addr, serving) = serve_proxy(state).await;
+    let mut r = reqwest::get(format!("http://{addr}/tvp/43.ts"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let result = tokio::time::timeout(Duration::from_secs(33), read_to_end(&mut r)).await;
+    assert!(result.is_ok(), "audio kept a dead video stream alive");
+    assert!(result.unwrap().1.is_err());
+    stop.cancel();
+    serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn video_activity_cannot_hide_a_stalled_audio_track() {
+    let mock = MockServer::start().await;
+    serve_media(&mock).await;
+    api_returns(&mock, 44, &format!("{}/cdn/live.m3u8", mock.uri())).await;
+    let (_dir, ffmpeg) = stub_ffmpeg(
+        "emit X; while :; do printf '\\107\\101\\000\\020'; printf '%0184d' 0; sleep 0.01; done",
+    );
+    let state = server::AppState {
+        ffmpeg,
+        media_timeout: Duration::from_secs(1),
+        ..proxy_state(&mock.uri(), 0)
+    };
+    let stop = state.shutdown.clone();
+    let metrics = state.metrics.clone();
+    let (addr, serving) = serve_proxy(state).await;
+    let mut r = reqwest::get(format!("http://{addr}/tvp/44.ts"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), read_to_end(&mut r))
+            .await
+            .unwrap()
+            .1
+            .is_err()
+    );
+    stop.cancel();
+    serving.await.unwrap().unwrap();
+    assert_eq!(
+        metric_value(
+            &metrics.render(0, 0),
+            "tvp_stream_ends_total{reason=\"media_timeout\"}"
+        ),
+        1.0
+    );
+}
+
+#[tokio::test]
+async fn startup_accepts_a_large_video_prefix_before_audio() {
+    let mock = MockServer::start().await;
+    serve_media(&mock).await;
+    api_returns(&mock, 45, &format!("{}/cdn/live.m3u8", mock.uri())).await;
+    let (_dir, ffmpeg) = stub_ffmpeg(
+        "n=0; while [ $n -lt 512 ]; do printf '\\107\\101\\000\\020'; printf '%0184d' 0; n=$((n+1)); done; emit X; exec sleep 1000",
+    );
+    let state = server::AppState {
+        ffmpeg,
+        ..proxy_state(&mock.uri(), 0)
+    };
+    let stop = state.shutdown.clone();
+    let (addr, serving) = serve_proxy(state).await;
+    let r = reqwest::get(format!("http://{addr}/tvp/45.ts"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    drop(r);
+    stop.cancel();
+    serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn startup_deadline_and_disconnect_reap_before_releasing_capacity() {
+    use tokio::io::AsyncWriteExt;
+    let mock = MockServer::start().await;
+    serve_media(&mock).await;
+    api_returns(&mock, 46, &format!("{}/cdn/live.m3u8", mock.uri())).await;
+    for disconnect in [false, true] {
+        let (_dir, ffmpeg) = stub_ffmpeg("echo $$ > \"$0.pid\"; exec sleep 1000");
+        let pid_file = ffmpeg.with_extension("pid");
+        let work = tempfile::tempdir().unwrap();
+        let slots = Arc::new(Semaphore::new(1));
+        let state = server::AppState {
+            ffmpeg,
+            work_dir: work.path().into(),
+            streams: slots.clone(),
+            startup_timeout: Duration::from_secs(1),
+            ..proxy_state(&mock.uri(), 0)
+        };
+        let stop = state.shutdown.clone();
+        let (addr, serving) = serve_proxy(state).await;
+        if disconnect {
+            let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            socket
+                .write_all(b"GET /tvp/46.ts HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            wait_until("startup child PID", || pid_file.exists()).await;
+            drop(socket);
+        } else {
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    reqwest::get(format!("http://{addr}/tvp/46.ts"))
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+                504
+            );
+        }
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        wait_until("startup reap", || !running(pid.trim())).await;
+        wait_until("startup capacity recovery", || {
+            slots.available_permits() == 1
+        })
+        .await;
+        wait_until("startup private-master cleanup", || {
+            std::fs::read_dir(work.path()).unwrap().next().is_none()
+        })
+        .await;
+        stop.cancel();
+        serving.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn endless_one_track_bootstrap_is_rejected_with_bounded_memory() {
+    let mock = MockServer::start().await;
+    serve_media(&mock).await;
+    api_returns(&mock, 47, &format!("{}/cdn/live.m3u8", mock.uri())).await;
+    let (_dir, ffmpeg) =
+        stub_ffmpeg("while :; do printf '\\107\\101\\001\\020'; printf '%0184d' 0; done");
+    let state = server::AppState {
+        ffmpeg,
+        ..proxy_state(&mock.uri(), 0)
+    };
+    let stop = state.shutdown.clone();
+    let (addr, serving) = serve_proxy(state).await;
+    let r = tokio::time::timeout(
+        Duration::from_secs(5),
+        reqwest::get(format!("http://{addr}/tvp/47.ts")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(r.status(), 502);
+    stop.cancel();
+    serving.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn bootstrap_forwarding_cannot_extend_the_media_silence_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mock = MockServer::start().await;
+    serve_media(&mock).await;
+    api_returns(&mock, 48, &format!("{}/cdn/live.m3u8", mock.uri())).await;
+    let (_dir, ffmpeg) = stub_ffmpeg(
+        "echo $$ > \"$0.pid\"; n=0; while [ $n -lt 10000 ]; do printf '\\107\\101\\000\\020'; printf '%0184d' 0; n=$((n+1)); done; emit X; exec sleep 1000",
+    );
+    let pid_file = ffmpeg.with_extension("pid");
+    let state = server::AppState {
+        ffmpeg,
+        media_timeout: Duration::from_secs(1),
+        downstream_timeout: Duration::from_secs(10),
+        ..proxy_state(&mock.uri(), 0)
+    };
+    let stop = state.shutdown.clone();
+    let listener = tokio::net::TcpSocket::new_v4().unwrap();
+    listener.set_send_buffer_size(1024).unwrap();
+    listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = listener.listen(128).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serving = tokio::spawn(server::serve(listener, state));
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(1024).unwrap();
+    let mut socket = socket.connect(addr).await.unwrap();
+    socket
+        .write_all(b"GET /tvp/48.ts HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    socket.read_exact(&mut [0; 1]).await.unwrap();
+    let pid = std::fs::read_to_string(pid_file).unwrap();
+    let reaped = tokio::time::timeout(Duration::from_secs(3), async {
+        while running(pid.trim()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    drop(socket);
+    stop.cancel();
+    serving.await.unwrap().unwrap();
+    assert!(
+        reaped.is_ok(),
+        "bootstrap forwarding hid silent media beyond its deadline"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_cancels_initial_resolution_before_spawning() {
+    use tokio::io::AsyncWriteExt;
+    let mock = MockServer::start().await;
+    serve_media(&mock).await;
+    let resolving = Arc::new(AtomicBool::new(false));
+    let started = resolving.clone();
+    let source = format!("{}/cdn/live.m3u8", mock.uri());
+    Mock::given(path("/api/products/49/videos/playlist"))
+        .respond_with(move |_: &wiremock::Request| {
+            started.store(true, Ordering::SeqCst);
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"sources":{"HLS":[{"src":source}]}}))
+                .set_delay(Duration::from_secs(3))
+        })
+        .mount(&mock)
+        .await;
+    let (_dir, ffmpeg) = stub_ffmpeg("echo run >> \"$0.runs\"; emit X; exec sleep 1000");
+    let runs = ffmpeg.with_extension("runs");
+    let state = server::AppState {
+        ffmpeg,
+        ..proxy_state(&mock.uri(), 0)
+    };
+    let stop = state.shutdown.clone();
+    let metrics = state.metrics.clone();
+    let (addr, mut serving) = serve_proxy(state).await;
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket
+        .write_all(b"GET /tvp/49.ts HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    wait_until("initial resolution", || resolving.load(Ordering::SeqCst)).await;
+    stop.cancel();
+    let stopped = tokio::time::timeout(Duration::from_secs(1), &mut serving).await;
+    let clean = stopped.is_ok();
+    drop(socket);
+    if !clean {
+        serving.await.unwrap().unwrap();
+    }
+    assert!(clean, "shutdown waited for initial upstream resolution");
+    assert!(
+        !runs.exists(),
+        "shutdown allowed an unnecessary child start"
+    );
+    assert_eq!(
+        metric_value(
+            &metrics.render(0, 0),
+            "tvp_resolves_in_flight{phase=\"initial\"}"
+        ),
+        0.0
+    );
+}
+
+#[tokio::test]
+async fn stalled_readers_are_reset_without_draining() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mock = MockServer::start().await;
+    serve_media(&mock).await;
+    api_returns(&mock, 41, &format!("{}/cdn/live.m3u8", mock.uri())).await;
+    let (_dir, ffmpeg) = stub_ffmpeg("echo $$ > \"$0.pid\"; while :; do emit X; done");
+    let pid_file = ffmpeg.with_extension("pid");
+    let slots = Arc::new(Semaphore::new(1));
+    let state = server::AppState {
+        ffmpeg,
+        streams: slots.clone(),
+        downstream_timeout: Duration::from_secs(1),
+        ..proxy_state(&mock.uri(), 0)
+    };
+    let stop = state.shutdown.clone();
+    let (addr, serving) = serve_proxy(state).await;
+    let mut retained = Vec::new();
+    for _ in 0..2 {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(1024).unwrap();
+        let mut socket = socket.connect(addr).await.unwrap();
+        socket
+            .write_all(b"GET /tvp/41.ts HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut first = [0; 1];
+        socket.read_exact(&mut first).await.unwrap();
+        wait_until("stub PID", || pid_file.exists()).await;
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(33), async {
+            loop {
+                if socket.take_error().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "stalled HTTP body was retained without resetting its connection"
+        );
+        wait_until("stalled child cleanup", || !running(pid.trim())).await;
+        wait_until("capacity recovery", || slots.available_permits() == 1).await;
+        retained.push(socket);
+    }
+    drop(retained);
+    stop.cancel();
+    serving.await.unwrap().unwrap();
+}
+
 /// Count running ffmpeg processes whose command line mentions `needle`.
 fn ffmpeg_running(needle: &str) -> usize {
     let out = Command::new("ps")
@@ -477,7 +906,14 @@ async fn client_disconnect_stops_ffmpeg() {
 fn stub_ffmpeg(script: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let bin = dir.path().join("ffmpeg");
-    std::fs::write(&bin, format!("#!/bin/sh\n{script}\n")).unwrap();
+    // Synthetic transport packets exercise lifecycle/activity, not decoding.
+    // Real HLS tests above exercise the codec/demuxer boundary independently.
+    let emit = r#"emit() {
+        [ "${#1}" -le 184 ] || exit 1
+        printf '\107\101\000\020'; printf '%-184s' "$1"
+        printf '\107\101\001\020'; printf '%-184s' ''
+    }"#;
+    std::fs::write(&bin, format!("#!/bin/sh\n{emit}\n{script}\n")).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     (dir, bin)
 }
@@ -506,7 +942,7 @@ fn running(pid: &str) -> bool {
 async fn client_disconnect_stops_stalled_ffmpeg() {
     // Emits once, then hangs without output like ffmpeg on a stalled upstream:
     // the disconnect must be noticed even though no more data arrives.
-    let (_dir, ffmpeg) = stub_ffmpeg(r#"echo $$ > "$0.pid"; printf X; exec sleep 1000"#);
+    let (_dir, ffmpeg) = stub_ffmpeg(r#"echo $$ > "$0.pid"; emit X; exec sleep 1000"#);
     let pid_file = ffmpeg.with_extension("pid");
     let mock = MockServer::start().await;
     serve_media(&mock).await;
@@ -534,18 +970,16 @@ async fn client_disconnect_stops_stalled_ffmpeg() {
 }
 
 #[tokio::test]
-async fn client_disconnect_during_retry_does_not_restart_ffmpeg() {
-    // ffmpeg exits at once, so the proxy waits `retry_delay` and re-resolves;
-    // a client that leaves meanwhile must not get a fresh ffmpeg.
-    let (_dir, ffmpeg) = stub_ffmpeg(r#"echo run >> "$0.runs"; printf X"#);
+async fn client_disconnect_after_output_does_not_restart_ffmpeg() {
+    // Even if a client leaves after the first child's output, no replacement
+    // may be started on its response.
+    let (_dir, ffmpeg) = stub_ffmpeg(r#"echo run >> "$0.runs"; emit X"#);
     let runs = ffmpeg.with_extension("runs");
     let mock = MockServer::start().await;
     serve_media(&mock).await;
     api_returns(&mock, 9, &format!("{}/cdn/live.m3u8", mock.uri())).await;
-    let retry_delay = Duration::from_secs(1);
     let (addr, _) = serve_proxy(server::AppState {
         ffmpeg,
-        retry_delay,
         ..proxy_state(&mock.uri(), 0)
     })
     .await;
@@ -557,7 +991,7 @@ async fn client_disconnect_during_retry_does_not_restart_ffmpeg() {
     assert!(resp.chunk().await.unwrap().is_some(), "got data");
     drop(resp);
 
-    tokio::time::sleep(retry_delay * 2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let runs = std::fs::read_to_string(&runs).unwrap();
     assert_eq!(runs.lines().count(), 1, "ffmpeg restarted for nobody");
     let resolves = mock
@@ -571,16 +1005,11 @@ async fn client_disconnect_during_retry_does_not_restart_ffmpeg() {
 }
 
 #[tokio::test]
-async fn client_disconnect_during_re_resolve_releases_stream() {
+async fn client_disconnect_during_initial_resolve_releases_request() {
     let (_dir, ffmpeg) = stub_ffmpeg(&format!(r#"echo run >> "$0.runs"; {PRINT_MASTER}"#));
     let runs = ffmpeg.with_extension("runs");
     let mock = MockServer::start().await;
     serve_media(&mock).await;
-    api_playlist(24, &format!("{}/cdn/live.m3u8", mock.uri()))
-        .up_to_n_times(1)
-        .expect(1)
-        .mount(&mock)
-        .await;
     let resolving = Arc::new(AtomicBool::new(false));
     let started = resolving.clone();
     Mock::given(path("/api/products/24/videos/playlist"))
@@ -600,61 +1029,67 @@ async fn client_disconnect_during_re_resolve_releases_stream() {
     let shutdown = state.shutdown.clone();
     let (addr, serving) = serve_proxy(state).await;
 
-    let mut resp = reqwest::get(format!("http://{addr}/tvp/24.ts"))
+    use tokio::io::AsyncWriteExt;
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket
+        .write_all(b"GET /tvp/24.ts HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await
         .unwrap();
-    let master = stub_master_path(&mut resp).await;
-    wait_until("the second API request to start", || {
+    wait_until("the initial API request to start", || {
         resolving.load(Ordering::SeqCst)
     })
     .await;
 
     let text = scrape_metrics(addr).await;
     assert_eq!(
-        metric_value(&text, "tvp_resolves_in_flight{phase=\"retry\"}"),
+        metric_value(&text, "tvp_resolves_in_flight{phase=\"initial\"}"),
         1.0
     );
-    assert_eq!(
-        metric_value(&text, "tvp_streams_active{channel=\"24\"}"),
-        1.0
-    );
-    assert_eq!(
-        metric_value(&text, "tvp_ffmpeg_processes_active{channel=\"24\"}"),
-        0.0
+    assert!(
+        !text.contains("channel=\"24\""),
+        "unresolved requests must not allocate channel metrics"
     );
 
-    // Leave while the API request is pending, not during the retry sleep.
-    // Cleanup must not wait for the upstream response or its 20 s timeout.
-    drop(resp);
-    wait_until("the master playlist to be removed", || !master.exists()).await;
+    // Initial resolution must cancel with the HTTP request, not wait for TVP.
+    drop(socket);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if metric_value(&scrape_metrics(addr).await, "tvp_stream_requests_in_flight") == 0.0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     wait_until("the slot to be freed", || streams.available_permits() == 1).await;
-    assert_eq!(std::fs::read_to_string(runs).unwrap().lines().count(), 1);
+    assert!(!runs.exists(), "child launched during unresolved request");
     mock.verify().await;
 
     let text = scrape_metrics(addr).await;
     assert_eq!(
-        metric_value(&text, "tvp_resolves_in_flight{phase=\"retry\"}"),
+        metric_value(&text, "tvp_resolves_in_flight{phase=\"initial\"}"),
         0.0
     );
     assert_eq!(
         metric_value(
             &text,
-            "tvp_resolve_total{phase=\"retry\",outcome=\"cancelled\"}"
+            "tvp_resolve_total{phase=\"initial\",outcome=\"cancelled\"}"
         ),
         1.0
     );
     assert_eq!(
-        metric_value(&text, "tvp_resolve_duration_seconds_count{phase=\"retry\"}"),
+        metric_value(
+            &text,
+            "tvp_resolve_duration_seconds_count{phase=\"initial\"}"
+        ),
         1.0
     );
     assert_eq!(
-        metric_value(&text, "tvp_stream_ends_total{reason=\"client_disconnect\"}"),
+        metric_value(&text, "tvp_stream_requests_total{outcome=\"cancelled\"}"),
         1.0
     );
-    assert_eq!(
-        metric_value(&text, "tvp_streams_active{channel=\"24\"}"),
-        0.0
-    );
+    assert!(!text.contains("channel=\"24\""));
     assert_eq!(metric_value(&text, "tvp_ffmpeg_restarts_total"), 0.0);
 
     shutdown.cancel();
@@ -669,7 +1104,7 @@ async fn client_disconnect_during_re_resolve_releases_stream() {
 async fn stub_master_path(resp: &mut reqwest::Response) -> PathBuf {
     assert_eq!(resp.status(), 200);
     let mut buf = Vec::new();
-    while !buf.contains(&b'\n') {
+    while buf.len() < 188 {
         let chunk = tokio::time::timeout(Duration::from_secs(10), resp.chunk())
             .await
             .expect("stub ffmpeg output")
@@ -677,8 +1112,7 @@ async fn stub_master_path(resp: &mut reqwest::Response) -> PathBuf {
             .expect("stream ended early");
         buf.extend_from_slice(&chunk);
     }
-    let line = buf.split(|&b| b == b'\n').next().unwrap();
-    PathBuf::from(String::from_utf8(line.to_vec()).unwrap())
+    PathBuf::from(stub_text(&buf[..188]))
 }
 
 #[tokio::test]
@@ -705,7 +1139,7 @@ async fn concurrent_streams_of_a_channel_use_separate_playlists() {
         .expect(2)
         .mount(&mock)
         .await;
-    api_playlist(12, &new).expect(1).mount(&mock).await;
+    api_playlist(12, &new).expect(0).mount(&mock).await;
     let (addr, _) = serve_proxy(server::AppState {
         ffmpeg,
         ..proxy_state(&mock.uri(), 0)
@@ -731,9 +1165,10 @@ async fn concurrent_streams_of_a_channel_use_separate_playlists() {
     let original_b = std::fs::read_to_string(&master_b).unwrap();
     assert_eq!(original_b.lines().last(), Some(old.as_str()));
     std::fs::write(restart, master_a.to_str().unwrap()).unwrap();
-    assert_eq!(stub_master_path(&mut a).await, master_a);
-    let refreshed_a = std::fs::read_to_string(&master_a).unwrap();
-    assert_eq!(refreshed_a.lines().last(), Some(new.as_str()));
+    assert!(
+        read_to_end(&mut a).await.1.is_err(),
+        "child exit must abort A, not append a new clock"
+    );
     assert_eq!(std::fs::read_to_string(&master_b).unwrap(), original_b);
 
     // A ending removes its own playlist, not the one B's ffmpeg is reading
@@ -747,12 +1182,26 @@ async fn concurrent_streams_of_a_channel_use_separate_playlists() {
 }
 
 /// Stub that prints the variant URL from the master playlist it reads, then fails.
-const PRINT_URL: &str = r#"while [ "$1" != -i ]; do shift; done; tail -n 1 "$2"; exit 1"#;
+const PRINT_URL: &str = r#"while [ "$1" != -i ]; do shift; done; emit "$(tail -n 1 "$2")"; exit 1"#;
 /// Stub start that prints the path of the master playlist it was given; see
 /// [`stub_master_path`].
-const PRINT_MASTER: &str = r#"for a; do [ "$prev" = -i ] && echo "$a"; prev=$a; done"#;
+const PRINT_MASTER: &str = r#"for a; do [ "$prev" = -i ] && emit "$a"; prev=$a; done"#;
 /// Stub that keeps sending output until it is killed.
-const TRICKLE: &str = "while :; do printf X; sleep 0.1; done";
+const TRICKLE: &str = "while :; do emit X; sleep 0.1; done";
+
+fn stub_text(bytes: &[u8]) -> String {
+    bytes
+        .as_chunks::<188>()
+        .0
+        .iter()
+        .filter(|p| p[0] == 0x47 && p[2] == 0)
+        .map(|p| {
+            String::from_utf8_lossy(&p[4..])
+                .trim_end_matches(' ')
+                .to_string()
+        })
+        .collect()
+}
 
 /// Stream a channel until the proxy gives up and return the body. Giving up
 /// must abort the transfer, so the client can't mistake it for a normal end.
@@ -764,7 +1213,7 @@ async fn fetch(addr: SocketAddr, channel: u64) -> String {
         assert_eq!(r.status(), 200);
         let (body, end) = read_to_end(&mut r).await;
         assert!(end.is_err(), "stream ended cleanly");
-        String::from_utf8(body).unwrap()
+        stub_text(&body)
     };
     tokio::time::timeout(Duration::from_secs(20), body)
         .await
@@ -772,52 +1221,49 @@ async fn fetch(addr: SocketAddr, channel: u64) -> String {
 }
 
 #[tokio::test]
-async fn gives_up_after_three_quick_failures() {
+async fn post_start_exit_never_replays_input() {
     let mock = MockServer::start().await;
     serve_media(&mock).await;
     api_playlist(10, &format!("{}/cdn/live.m3u8", mock.uri()))
-        .expect(3)
+        .expect(1)
         .mount(&mock)
         .await;
-    let (_dir, ffmpeg) = stub_ffmpeg("printf X; exit 1");
+    let (_dir, ffmpeg) = stub_ffmpeg("emit X; exit 1");
     let (addr, _) = serve_proxy(server::AppState {
         ffmpeg,
         ..proxy_state(&mock.uri(), 0)
     })
     .await;
 
-    // the first run plus two restarts, each after re-resolving
-    assert_eq!(fetch(addr, 10).await, "XXX");
+    assert_eq!(fetch(addr, 10).await, "X");
     mock.verify().await;
 }
 
 #[tokio::test]
-async fn long_run_resets_quick_failure_count() {
+async fn long_run_exit_also_aborts_without_respawn() {
     let mock = MockServer::start().await;
     serve_media(&mock).await;
     api_playlist(11, &format!("{}/cdn/live.m3u8", mock.uri()))
-        .expect(6)
+        .expect(1)
         .mount(&mock)
         .await;
-    // prints its run number; only run 3 outlasts `quick_failure`
+    // A long successful run does not grant permission to append a new clock.
     let (_dir, ffmpeg) = stub_ffmpeg(
-        r#"echo >> "$0.runs"; n=$(wc -l < "$0.runs"); printf $n
-        if [ $n = 3 ]; then sleep 2; fi; exit 1"#,
+        r#"echo >> "$0.runs"; n=$(wc -l < "$0.runs"); emit "$n"
+        sleep 1; exit 1"#,
     );
     let (addr, _) = serve_proxy(server::AppState {
         ffmpeg,
-        quick_failure: Duration::from_secs(1),
         ..proxy_state(&mock.uri(), 0)
     })
     .await;
 
-    // 1 and 2 fail quickly, 3 resets the count, 4 to 6 fail quickly again
-    assert_eq!(fetch(addr, 11).await, "123456");
+    assert_eq!(fetch(addr, 11).await, "1");
     mock.verify().await;
 }
 
 #[tokio::test]
-async fn restart_uses_re_resolved_url() {
+async fn response_exit_does_not_resolve_a_new_url() {
     let mock = MockServer::start().await;
     serve_media(&mock).await;
     let old = format!("{}/cdn/old.m3u8", mock.uri());
@@ -827,7 +1273,7 @@ async fn restart_uses_re_resolved_url() {
         .expect(1)
         .mount(&mock)
         .await;
-    api_playlist(13, &new).expect(2).mount(&mock).await;
+    api_playlist(13, &new).expect(0).mount(&mock).await;
     let (_dir, ffmpeg) = stub_ffmpeg(PRINT_URL);
     let (addr, _) = serve_proxy(server::AppState {
         ffmpeg,
@@ -835,12 +1281,12 @@ async fn restart_uses_re_resolved_url() {
     })
     .await;
 
-    assert_eq!(fetch(addr, 13).await, format!("{old}\n{new}\n{new}\n"));
+    assert_eq!(fetch(addr, 13).await, old);
     mock.verify().await;
 }
 
 #[tokio::test]
-async fn restart_keeps_old_url_if_re_resolve_fails() {
+async fn response_exit_does_not_retry_an_old_url() {
     let mock = MockServer::start().await;
     serve_media(&mock).await;
     let old = format!("{}/cdn/old.m3u8", mock.uri());
@@ -851,7 +1297,7 @@ async fn restart_keeps_old_url_if_re_resolve_fails() {
         .await;
     Mock::given(path("/api/products/14/videos/playlist"))
         .respond_with(ResponseTemplate::new(500))
-        .expect(2)
+        .expect(0)
         .mount(&mock)
         .await;
     let (_dir, ffmpeg) = stub_ffmpeg(PRINT_URL);
@@ -861,7 +1307,7 @@ async fn restart_keeps_old_url_if_re_resolve_fails() {
     })
     .await;
 
-    assert_eq!(fetch(addr, 14).await, format!("{old}\n{old}\n{old}\n"));
+    assert_eq!(fetch(addr, 14).await, old);
     mock.verify().await;
     let text = scrape_metrics(addr).await;
     assert_eq!(
@@ -869,15 +1315,15 @@ async fn restart_keeps_old_url_if_re_resolve_fails() {
             &text,
             "tvp_resolve_total{phase=\"retry\",outcome=\"http_error\"}"
         ),
-        2.0
+        0.0
     );
-    assert_eq!(metric_value(&text, "tvp_ffmpeg_restarts_total"), 2.0);
+    assert_eq!(metric_value(&text, "tvp_ffmpeg_restarts_total"), 0.0);
     assert_eq!(
         metric_value(&text, "tvp_stream_requests_total{outcome=\"started\"}"),
         1.0
     );
     assert_eq!(
-        metric_value(&text, "tvp_stream_ends_total{reason=\"quick_failures\"}"),
+        metric_value(&text, "tvp_stream_ends_total{reason=\"upstream_exit\"}"),
         1.0
     );
 }
@@ -930,15 +1376,15 @@ async fn ffmpeg_start_failure_returns_500() {
 }
 
 #[tokio::test]
-async fn restart_failure_aborts_the_response() {
+async fn removed_executable_after_start_does_not_trigger_a_restart() {
     let mock = MockServer::start().await;
     serve_media(&mock).await;
     api_playlist(19, &format!("{}/cdn/live.m3u8", mock.uri()))
-        .expect(2)
+        .expect(1)
         .mount(&mock)
         .await;
     // deletes itself, so the restart cannot spawn it
-    let (_dir, ffmpeg) = stub_ffmpeg(r#"printf X; rm -- "$0"; exit 1"#);
+    let (_dir, ffmpeg) = stub_ffmpeg(r#"emit X; rm -- "$0"; exit 1"#);
     let (addr, _) = serve_proxy(server::AppState {
         ffmpeg,
         ..proxy_state(&mock.uri(), 0)
@@ -949,7 +1395,7 @@ async fn restart_failure_aborts_the_response() {
     mock.verify().await;
     let text = scrape_metrics(addr).await;
     assert_eq!(
-        metric_value(&text, "tvp_stream_ends_total{reason=\"restart_error\"}"),
+        metric_value(&text, "tvp_stream_ends_total{reason=\"upstream_exit\"}"),
         1.0
     );
     assert_eq!(metric_value(&text, "tvp_ffmpeg_restarts_total"), 0.0);
@@ -1076,7 +1522,7 @@ async fn shutdown_does_not_wait_for_a_client_that_stopped_reading() {
     let mock = MockServer::start().await;
     serve_media(&mock).await;
     api_returns(&mock, 23, &format!("{}/cdn/live.m3u8", mock.uri())).await;
-    let (_dir, ffmpeg) = stub_ffmpeg("exec dd if=/dev/zero bs=65536 2>/dev/null");
+    let (_dir, ffmpeg) = stub_ffmpeg("while :; do emit X; done");
     let streams = Arc::new(Semaphore::new(1));
     let state = server::AppState {
         ffmpeg,
@@ -1276,35 +1722,35 @@ async fn metrics_endpoint_is_self_contained() {
 }
 
 #[tokio::test]
-async fn metrics_preserve_short_streams_and_restarts_between_scrapes() {
+async fn metrics_preserve_short_stream_exit_between_scrapes() {
     let mock = MockServer::start().await;
     serve_media(&mock).await;
     api_returns(&mock, 30, &format!("{}/cdn/live.m3u8", mock.uri())).await;
-    let (_dir, ffmpeg) = stub_ffmpeg("printf X; exit 1");
+    let (_dir, ffmpeg) = stub_ffmpeg("emit X; exit 1");
     let (addr, _) = serve_proxy(server::AppState {
         ffmpeg,
         ..proxy_state(&mock.uri(), 0)
     })
     .await;
 
-    assert_eq!(fetch(addr, 30).await, "XXX");
+    assert_eq!(fetch(addr, 30).await, "X");
     for _ in 0..2 {
         let text = scrape_metrics(addr).await;
         for (sample, expected) in [
             ("tvp_stream_requests_total{outcome=\"started\"}", 1.0),
             ("tvp_stream_requests_in_flight", 0.0),
             ("tvp_streams_active{channel=\"30\"}", 0.0),
-            ("tvp_stream_bytes_total{channel=\"30\"}", 3.0),
-            ("tvp_stream_ends_total{reason=\"quick_failures\"}", 1.0),
+            ("tvp_stream_bytes_total{channel=\"30\"}", 376.0),
+            ("tvp_stream_ends_total{reason=\"upstream_exit\"}", 1.0),
             ("tvp_ffmpeg_processes_active{channel=\"30\"}", 0.0),
-            ("tvp_ffmpeg_restarts_total", 2.0),
+            ("tvp_ffmpeg_restarts_total", 0.0),
             ("tvp_resolve_total{phase=\"initial\",outcome=\"ok\"}", 1.0),
-            ("tvp_resolve_total{phase=\"retry\",outcome=\"ok\"}", 2.0),
+            ("tvp_resolve_total{phase=\"retry\",outcome=\"ok\"}", 0.0),
             ("tvp_resolve_duration_seconds_count{phase=\"initial\"}", 1.0),
-            ("tvp_resolve_duration_seconds_count{phase=\"retry\"}", 2.0),
+            ("tvp_resolve_duration_seconds_count{phase=\"retry\"}", 0.0),
             (
                 "tvp_resolve_duration_seconds_bucket{phase=\"retry\",le=\"+Inf\"}",
-                2.0,
+                0.0,
             ),
             ("tvp_stream_startup_seconds_count", 1.0),
             ("tvp_stream_startup_seconds_bucket{le=\"+Inf\"}", 1.0),
@@ -1321,7 +1767,7 @@ async fn metrics_track_concurrent_connections_and_disconnects() {
     let mock = MockServer::start().await;
     serve_media(&mock).await;
     api_returns(&mock, 31, &format!("{}/cdn/live.m3u8", mock.uri())).await;
-    let (_dir, ffmpeg) = stub_ffmpeg("printf X; exec sleep 1000");
+    let (_dir, ffmpeg) = stub_ffmpeg("emit X; exec sleep 1000");
     let streams = Arc::new(Semaphore::new(2));
     let (addr, _) = serve_proxy(server::AppState {
         ffmpeg,
@@ -1332,8 +1778,8 @@ async fn metrics_track_concurrent_connections_and_disconnects() {
     let url = format!("http://{addr}/tvp/31.ts");
     let mut a = reqwest::get(&url).await.unwrap();
     let mut b = reqwest::get(&url).await.unwrap();
-    assert_eq!(&a.chunk().await.unwrap().unwrap()[..], b"X");
-    assert_eq!(&b.chunk().await.unwrap().unwrap()[..], b"X");
+    assert_eq!(stub_text(&a.chunk().await.unwrap().unwrap()), "X");
+    assert_eq!(stub_text(&b.chunk().await.unwrap().unwrap()), "X");
 
     let text = scrape_metrics(addr).await;
     assert_eq!(metric_value(&text, "tvp_stream_slots_in_use"), 2.0);
@@ -1347,7 +1793,7 @@ async fn metrics_track_concurrent_connections_and_disconnects() {
     );
     assert_eq!(
         metric_value(&text, "tvp_stream_bytes_total{channel=\"31\"}"),
-        2.0
+        752.0
     );
     let ongoing = metric_value(&text, "tvp_stream_seconds_total{channel=\"31\"}");
     assert!(
@@ -1453,11 +1899,17 @@ async fn metrics_stream_without_output_has_no_startup_observation() {
         ..proxy_state(&mock.uri(), 0)
     })
     .await;
-    assert_eq!(fetch(addr, 32).await, "");
+    assert_eq!(
+        reqwest::get(format!("http://{addr}/tvp/32.ts"))
+            .await
+            .unwrap()
+            .status(),
+        502
+    );
     let text = scrape_metrics(addr).await;
     assert_eq!(
         metric_value(&text, "tvp_stream_requests_total{outcome=\"started\"}"),
-        1.0
+        0.0
     );
     assert_eq!(metric_value(&text, "tvp_stream_startup_seconds_count"), 0.0);
     assert_eq!(
@@ -1465,7 +1917,7 @@ async fn metrics_stream_without_output_has_no_startup_observation() {
         0.0
     );
     assert_eq!(
-        metric_value(&text, "tvp_stream_ends_total{reason=\"quick_failures\"}"),
+        metric_value(&text, "tvp_stream_ends_total{reason=\"upstream_exit\"}"),
         1.0
     );
 }

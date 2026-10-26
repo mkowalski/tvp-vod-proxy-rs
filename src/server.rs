@@ -1,17 +1,20 @@
 //! HTTP server: `GET /tvp/<id>.ts` streams the channel as MPEG-TS.
 
+use crate::connection::Connection;
 use crate::hls;
 use crate::metrics::{
     ChannelMetrics, EndReason, Metrics, ProcessGuard, RequestOutcome, ResolvePhase, StreamGuard,
 };
+use crate::transport::Tracker;
 use crate::tvp::{Client, ResolveError};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use bytes::Bytes;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -20,13 +23,12 @@ use tempfile::TempPath;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-/// Give up after this many consecutive quick failures.
-const MAX_QUICK_FAILURES: u32 = 3;
-
 type Tx = mpsc::Sender<Bytes>;
+const CHUNK: usize = 64 * 1024;
+const QUEUE: usize = 32;
 
 /// Shared configuration for all streams.
 #[derive(Clone)]
@@ -38,10 +40,6 @@ pub struct AppState {
     pub ffmpeg: PathBuf,
     /// Directory for the per-stream master playlists given to ffmpeg.
     pub work_dir: PathBuf,
-    /// Pause before re-resolving after ffmpeg exits.
-    pub retry_delay: Duration,
-    /// ffmpeg runs shorter than this count as a quick failure.
-    pub quick_failure: Duration,
     /// One permit per running stream, taken once its channel has resolved;
     /// requests that find none get 503.
     pub streams: Arc<Semaphore>,
@@ -49,6 +47,12 @@ pub struct AppState {
     pub shutdown: CancellationToken,
     /// After `shutdown`, how long [`serve`] waits for responses to finish.
     pub shutdown_grace: Duration,
+    /// Maximum time a client may leave output queued without accepting it.
+    pub downstream_timeout: Duration,
+    /// Overall resolve/startup ceiling, including waiting for both tracks.
+    pub startup_timeout: Duration,
+    /// Maximum silence of either required track after streaming starts.
+    pub media_timeout: Duration,
 }
 
 /// Serve until `state.shutdown` is cancelled, then give running responses up
@@ -57,8 +61,11 @@ pub struct AppState {
 pub async fn serve(listener: TcpListener, state: AppState) -> std::io::Result<()> {
     let shutdown = state.shutdown.clone();
     let grace = state.shutdown_grace;
-    let server = axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown.clone().cancelled_owned());
+    let server = axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<Connection>(),
+    )
+    .with_graceful_shutdown(shutdown.clone().cancelled_owned());
     tokio::select! {
         r = server => r,
         () = async {
@@ -82,7 +89,7 @@ pub fn router(state: AppState) -> Router {
         capacity
     };
     Router::new()
-        .route("/tvp/{file}", get(stream))
+        .route("/tvp/{file}", get(stream).head(head))
         .route("/healthz", get(|| async { "ok" }))
         .route(
             "/metrics",
@@ -121,11 +128,54 @@ async fn resolve(
     result
 }
 
-async fn stream(State(state): State<Arc<AppState>>, Path(file): Path<String>) -> Response {
+async fn head(Path(file): Path<String>) -> Response {
+    if channel_id(&file).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // Unknown size prevents a false Content-Length:0 for the endless GET.
+    struct Metadata;
+    impl futures_core::Stream for Metadata {
+        type Item = std::io::Result<Bytes>;
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(None)
+        }
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "video/mp2t"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Body::from_stream(Metadata),
+    )
+        .into_response()
+}
+
+async fn stream(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(connection): ConnectInfo<Connection>,
+    Path(file): Path<String>,
+) -> Response {
+    tokio::select! {
+        biased;
+        () = state.shutdown.cancelled() => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        result = tokio::time::timeout(state.startup_timeout,open_stream(state.clone(), connection, file)) => match result {
+            Ok(response) => response,
+            Err(_) => (StatusCode::GATEWAY_TIMEOUT,"upstream startup deadline\n").into_response(),
+        }
+    }
+}
+
+async fn open_stream(state: Arc<AppState>, connection: Connection, file: String) -> Response {
     let requested = Instant::now();
     let Some(channel) = channel_id(&file) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if connection.0.is_none() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let request = state.metrics.request();
     // resolve once up front so errors become proper HTTP status codes
     let selection = match resolve(&state, channel, ResolvePhase::Initial).await {
@@ -178,110 +228,133 @@ async fn stream(State(state): State<Arc<AppState>>, Path(file): Path<String>) ->
             return (StatusCode::INTERNAL_SERVER_ERROR, "cannot start ffmpeg\n").into_response();
         }
     };
-    tracing::info!(channel, bitrate = selection.bitrate, "stream started");
 
-    let (tx, rx) = mpsc::channel(32);
+    let (tx, rx) = mpsc::channel(QUEUE);
+    let (ready, started) = oneshot::channel();
+    let cancel = CancelOnDrop(state.shutdown.child_token());
     let session = metrics.stream(permit);
+    let task = Session {
+        state,
+        channel,
+        _master: master,
+        child,
+        session,
+        connection,
+        cancel: cancel.0.clone(),
+    };
+    tokio::spawn(task.run(tx, ready));
+    if !matches!(started.await, Ok(Ok(()))) {
+        request.finish(RequestOutcome::FfmpegError);
+        return (
+            StatusCode::BAD_GATEWAY,
+            "upstream has no usable video/audio\n",
+        )
+            .into_response();
+    }
     request.finish(RequestOutcome::Started);
-    tokio::spawn(pump(state, channel, selection, master, child, tx, session));
+    tracing::info!(channel, bitrate = selection.bitrate, "stream started");
 
     Response::builder()
         .header(header::CONTENT_TYPE, "video/mp2t")
-        .body(Body::from_stream(LiveBody::new(rx, metrics, requested)))
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from_stream(LiveBody::new(
+            rx,
+            metrics,
+            requested,
+            Some(cancel),
+        )))
         .expect("valid response")
 }
 
-/// Stream until the client goes away, ffmpeg keeps failing or can't be
-/// restarted, or the server shuts down. In all but the first case the
-/// response ends with an error, so the client sees an aborted transfer rather
-/// than a normal end of stream.
-async fn pump(
+/// One admitted connection owns one child and a private master until cleanup.
+/// No second process may append a reset timeline to this response.
+struct Session {
     state: Arc<AppState>,
     channel: u64,
-    selection: hls::Selection,
-    master: TempPath,
+    _master: TempPath,
     child: TrackedChild,
-    tx: Tx,
     session: StreamGuard,
-) {
-    let result = tokio::select! {
-        r = restart_loop(&state, channel, selection, &master, child, &tx, session.metrics()) => r,
-        () = state.shutdown.cancelled() => Err(EndReason::Shutdown),
-    };
-    if result.is_err() {
-        // dropping `tx` fails the response (see `LiveBody`), and hyper discards
-        // response data it has not written out yet when the body fails, so let
-        // it take everything sent so far first. Not on shutdown: a client that
-        // stopped reading would hold us up forever.
-        tokio::select! {
-            _ = tx.reserve_many(tx.max_capacity()) => {}
-            () = state.shutdown.cancelled() => {}
-        }
-    }
-    tracing::info!(
-        channel,
-        reason = result.err().map(EndReason::message),
-        "stream ended"
-    );
-    session.finish(result.err().unwrap_or(EndReason::ClientDisconnect));
+    connection: Connection,
+    cancel: CancellationToken,
 }
 
-/// Forward ffmpeg's output, and restart it with a fresh URL when it stops.
-/// Returns Ok when the client goes away, Err when ffmpeg keeps failing quickly
-/// or cannot be restarted.
-async fn restart_loop(
-    state: &AppState,
-    channel: u64,
-    mut selection: hls::Selection,
-    master: &std::path::Path,
-    mut child: TrackedChild,
-    tx: &Tx,
-    metrics: &Arc<ChannelMetrics>,
-) -> Result<(), EndReason> {
-    let mut failures = 0;
-    loop {
-        let started = Instant::now();
-        if forward(child, tx).await {
-            return Ok(());
-        }
-        let ran = started.elapsed();
-        failures = if ran < state.quick_failure {
-            failures + 1
-        } else {
-            0
+struct CancelOnDrop(CancellationToken);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+impl Session {
+    async fn run(mut self, tx: Tx, ready: oneshot::Sender<Result<(), ()>>) {
+        let channel = self.channel;
+        let state = &self.state;
+        let mut stdout = self.child.child.stdout.take().expect("piped stdout");
+        let mut tracker = Tracker::default();
+        let started = tokio::select! {
+            r = bootstrap(&mut stdout, &mut tracker) => r,
+            () = self.cancel.cancelled() => Err(std::io::Error::other("startup cancelled")),
         };
-        if failures >= MAX_QUICK_FAILURES {
-            tracing::error!(channel, failures, "giving up after quick failures");
-            return Err(EndReason::QuickFailures);
-        }
-        tracing::warn!(channel, secs = ran.as_secs(), "ffmpeg ended, re-resolving");
-        let resolved = tokio::select! {
-            r = async {
-                tokio::time::sleep(state.retry_delay).await;
-                resolve(state, channel, ResolvePhase::Retry).await
-            } => r,
-            // don't restart ffmpeg for a client that left in the meantime
-            () = tx.closed() => return Ok(()),
-        };
-        match resolved {
-            Ok(sel) => selection = sel,
-            Err(e) => tracing::warn!(channel, error = %e, "re-resolve failed, retrying old URL"),
-        }
-        child = match start_ffmpeg(&state.ffmpeg, master, &selection, metrics).await {
-            Ok(child) => {
-                metrics.restarted();
-                child
+        let mut result = match started {
+            Ok(prefix) => {
+                if ready.send(Ok(())).is_err() {
+                    Ok(())
+                } else {
+                    tokio::select! {
+                        r = forward(&mut stdout, &tx, state, &mut tracker, prefix) => r,
+                        () = self.cancel.cancelled() => if state.shutdown.is_cancelled() { Err(EndReason::Shutdown) } else { Ok(()) },
+                    }
+                }
             }
-            Err(e) => {
-                tracing::error!(channel, error = %e, "cannot start ffmpeg");
-                return Err(EndReason::RestartError);
+            Err(_) => {
+                let _ = ready.send(Err(()));
+                Err(EndReason::UpstreamExit)
             }
         };
+        // Own the child outside the cancellable forwarding future. Reap it before
+        // the process gauge and stream permit can be released.
+        if let Err(error) = self.child.child.kill().await {
+            tracing::error!(channel, %error, "child cleanup failed");
+        }
+        drop(self.child);
+        if state.shutdown.is_cancelled() {
+            result = Err(EndReason::Shutdown);
+        }
+        if matches!(
+            result,
+            Err(EndReason::DownstreamTimeout | EndReason::MediaTimeout | EndReason::Shutdown)
+        ) {
+            if let Err(error) = self.connection.abort() {
+                tracing::error!(channel, %error, "connection abort failed");
+            }
+        } else if result.is_err() {
+            // dropping `tx` fails the response (see `LiveBody`), and hyper discards
+            // response data it has not written out yet when the body fails, so let
+            // it take everything sent so far first. Not on shutdown: a client that
+            // stopped reading would hold us up forever.
+            let drained = tokio::select! {
+                r = tokio::time::timeout(state.downstream_timeout, tx.reserve_many(tx.max_capacity())) => r.is_ok(),
+                () = self.cancel.cancelled() => true,
+            };
+            if !drained || state.shutdown.is_cancelled() {
+                result = Err(EndReason::DownstreamTimeout);
+                if let Err(error) = self.connection.abort() {
+                    tracing::error!(channel, %error, "connection abort failed");
+                }
+            }
+        }
+        tracing::info!(
+            channel,
+            reason = result.err().map(EndReason::message),
+            "stream ended"
+        );
+        self.session
+            .finish(result.err().unwrap_or(EndReason::ClientDisconnect));
     }
 }
 
 /// Keep the process gauge tied to Child ownership, including cancellation of
-/// a pending read or the entire restart loop. Child still kills itself on drop.
+/// a pending read or the entire session. Child still kills itself on drop.
 struct TrackedChild {
     child: Child,
     _metrics: ProcessGuard,
@@ -308,7 +381,21 @@ async fn start_ffmpeg(
         .arg("-i")
         .arg(master)
         .args([
-            "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-f", "mpegts", "pipe:1",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-sn",
+            "-dn",
+            "-c",
+            "copy",
+            "-streamid",
+            "0:256",
+            "-streamid",
+            "1:257",
+            "-f",
+            "mpegts",
+            "pipe:1",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -320,45 +407,137 @@ async fn start_ffmpeg(
     })
 }
 
-/// Forward ffmpeg's output to the client, then kill ffmpeg.
-/// Returns true if the client disconnected, false if ffmpeg exited.
-async fn forward(mut child: TrackedChild, tx: &Tx) -> bool {
-    let mut stdout = child.child.stdout.take().expect("piped stdout");
-    let mut buf = vec![0u8; 64 * 1024];
-    let gone = loop {
-        let n = tokio::select! {
-            r = stdout.read(&mut buf) => match r {
-                Ok(0) | Err(_) => break false,
-                Ok(n) => n,
-            },
-            // notice a disconnect even while ffmpeg produces no output
-            () = tx.closed() => break true,
-        };
-        if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-            break true;
+/// Bounded startup chunks and the last payload activity of both required tracks.
+struct Bootstrap {
+    chunks: VecDeque<Bytes>,
+    video: tokio::time::Instant,
+    audio: tokio::time::Instant,
+}
+
+async fn bootstrap(
+    stdout: &mut tokio::process::ChildStdout,
+    tracker: &mut Tracker,
+) -> std::io::Result<Bootstrap> {
+    let mut chunks = VecDeque::new();
+    let mut size = 0;
+    let (mut video, mut audio) = (None, None);
+    let mut buf = [0u8; CHUNK];
+    loop {
+        if size == CHUNK * QUEUE {
+            return Err(std::io::Error::other("A/V bootstrap limit"));
         }
-    };
-    let _ = child.child.kill().await;
-    gone
+        let room = CHUNK.min(CHUNK * QUEUE - size);
+        let n = stdout.read(&mut buf[..room]).await?;
+        if n == 0 {
+            return Err(std::io::Error::other("missing A/V output"));
+        }
+        let seen = tracker.feed(&buf[..n])?;
+        let now = tokio::time::Instant::now();
+        if seen.video {
+            video = Some(now);
+        }
+        if seen.audio {
+            audio = Some(now);
+        }
+        size += n;
+        chunks.push_back(Bytes::copy_from_slice(&buf[..n]));
+        if let (Some(video), Some(audio)) = (video, audio) {
+            return Ok(Bootstrap {
+                chunks,
+                video,
+                audio,
+            });
+        }
+    }
+}
+
+async fn forward(
+    stdout: &mut tokio::process::ChildStdout,
+    tx: &Tx,
+    state: &AppState,
+    tracker: &mut Tracker,
+    mut prefix: Bootstrap,
+) -> Result<(), EndReason> {
+    while let Some(chunk) = prefix.chunks.pop_front() {
+        let (deadline, expired) = output_deadline(state, &prefix)?;
+        match tokio::time::timeout_at(deadline, tx.send(chunk)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Ok(()),
+            Err(_) => return Err(expired),
+        }
+    }
+    let mut buf = [0u8; CHUNK];
+    loop {
+        // Reserve before reading: a full media queue must not also retain an
+        // additional allocated chunk outside its budget.
+        let (deadline, expired) = output_deadline(state, &prefix)?;
+        let slot = match tokio::time::timeout_at(deadline, tx.reserve()).await {
+            Ok(Ok(slot)) => slot,
+            Ok(Err(_)) => return Ok(()),
+            Err(_) => return Err(expired),
+        };
+        let deadline = prefix.video.min(prefix.audio) + state.media_timeout;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(EndReason::MediaTimeout);
+        }
+        let n = match tokio::time::timeout_at(deadline, stdout.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => n,
+            Ok(_) => return Err(EndReason::UpstreamExit),
+            Err(_) => return Err(EndReason::MediaTimeout),
+        };
+        let seen = tracker
+            .feed(&buf[..n])
+            .map_err(|_| EndReason::UpstreamExit)?;
+        let now = tokio::time::Instant::now();
+        if seen.video {
+            prefix.video = now;
+        }
+        if seen.audio {
+            prefix.audio = now;
+        }
+        slot.send(Bytes::copy_from_slice(&buf[..n]));
+    }
+}
+
+fn output_deadline(
+    state: &AppState,
+    activity: &Bootstrap,
+) -> Result<(tokio::time::Instant, EndReason), EndReason> {
+    let now = tokio::time::Instant::now();
+    let media = activity.video.min(activity.audio) + state.media_timeout;
+    if now >= media {
+        return Err(EndReason::MediaTimeout);
+    }
+    let downstream = now + state.downstream_timeout;
+    if media <= downstream {
+        Ok((media, EndReason::MediaTimeout))
+    } else {
+        Ok((downstream, EndReason::DownstreamTimeout))
+    }
 }
 
 /// The response body: the data `pump` sends, then an error once `pump` drops
-/// its sender. A live stream never ends normally: with the client still there,
-/// `pump` only stops when ffmpeg keeps failing or can't be restarted, or on
-/// shutdown, and the client must see an aborted transfer, not an end of
-/// programme.
+/// its sender. A live stream never ends normally: upstream exit, track silence
+/// or shutdown must be distinguishable from a successful finite programme.
 struct LiveBody {
     rx: mpsc::Receiver<Bytes>,
     metrics: Arc<ChannelMetrics>,
     requested: Option<Instant>,
+    _cancel: Option<CancelOnDrop>,
 }
 
 impl LiveBody {
-    fn new(rx: mpsc::Receiver<Bytes>, metrics: Arc<ChannelMetrics>, requested: Instant) -> Self {
+    fn new(
+        rx: mpsc::Receiver<Bytes>,
+        metrics: Arc<ChannelMetrics>,
+        requested: Instant,
+        cancel: Option<CancelOnDrop>,
+    ) -> Self {
         Self {
             rx,
             metrics,
             requested: Some(requested),
+            _cancel: cancel,
         }
     }
 }
@@ -401,7 +580,7 @@ mod tests {
         for data in [b"".as_slice(), b"sent", b"also", b"discarded"] {
             tx.send(Bytes::copy_from_slice(data)).await.unwrap();
         }
-        let mut body = LiveBody::new(rx, metrics.channel(1), Instant::now());
+        let mut body = LiveBody::new(rx, metrics.channel(1), Instant::now(), None);
         let empty = std::future::poll_fn(|cx| Pin::new(&mut body).poll_next(cx)).await;
         assert!(empty.unwrap().unwrap().is_empty());
         assert!(

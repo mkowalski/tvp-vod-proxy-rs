@@ -83,11 +83,12 @@ async fn serve(client: tvp::Client) -> anyhow::Result<()> {
         metrics: Arc::default(),
         ffmpeg: PathBuf::from(env("FFMPEG", "ffmpeg".to_string())?),
         work_dir: std::env::temp_dir(),
-        retry_delay: Duration::from_secs(1),
-        quick_failure: Duration::from_secs(30),
         streams: Arc::new(Semaphore::new(max_streams)),
         shutdown: shutdown.clone(),
         shutdown_grace: SHUTDOWN_GRACE,
+        downstream_timeout: Duration::from_secs(30),
+        startup_timeout: Duration::from_secs(120),
+        media_timeout: Duration::from_secs(30),
     };
     let listener = tokio::net::TcpListener::bind((bind, port)).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");

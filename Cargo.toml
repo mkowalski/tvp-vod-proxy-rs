@@ -9,9 +9,10 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-axum = "0.8"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "tracing"] }
 bytes = "1"
 futures-core = "0.3"
+libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
