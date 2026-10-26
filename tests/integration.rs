@@ -1203,6 +1203,67 @@ fn stub_text(bytes: &[u8]) -> String {
         .collect()
 }
 
+async fn read_stub_pair(response: &mut reqwest::Response) -> Vec<u8> {
+    // HTTP frames and pipe reads need not coincide with 188-byte TS packets.
+    // Read the whole one-shot fixture before checking its payload or counters.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        assert_eq!(response.status(), 200);
+        let mut bytes = Vec::with_capacity(376);
+        while bytes.len() < 376 {
+            let chunk = response.chunk().await.unwrap().expect("complete stub pair");
+            bytes.extend_from_slice(&chunk);
+            assert!(bytes.len() <= 376, "unexpected extra fixture payload");
+        }
+        bytes
+    })
+    .await
+    .expect("complete stub pair before deadline")
+}
+
+#[tokio::test]
+async fn stub_packet_pair_survives_split_http_chunks() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+            let mut bytes = [0; 1024];
+            let n = socket.read(&mut bytes).await.unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&bytes[..n]);
+            assert!(request.len() <= 8192);
+        }
+        let mut pair = vec![b' '; 376];
+        pair[..4].copy_from_slice(&[0x47, 0x41, 0x00, 0x10]);
+        pair[4] = b'X';
+        pair[188..192].copy_from_slice(&[0x47, 0x41, 0x01, 0x10]);
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        for bytes in [&pair[..2], &pair[2..189], &pair[189..]] {
+            socket
+                .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+                .await
+                .unwrap();
+            socket.write_all(bytes).await.unwrap();
+            socket.write_all(b"\r\n").await.unwrap();
+        }
+        socket.write_all(b"0\r\n\r\n").await.unwrap();
+    });
+    let mut response = reqwest::get(format!("http://{addr}/fixture"))
+        .await
+        .unwrap();
+    let pair = read_stub_pair(&mut response).await;
+    server.await.unwrap();
+    assert_eq!(pair.len(), 376);
+    assert_eq!(stub_text(&pair), "X");
+}
+
 /// Stream a channel until the proxy gives up and return the body. Giving up
 /// must abort the transfer, so the client can't mistake it for a normal end.
 async fn fetch(addr: SocketAddr, channel: u64) -> String {
@@ -1778,8 +1839,8 @@ async fn metrics_track_concurrent_connections_and_disconnects() {
     let url = format!("http://{addr}/tvp/31.ts");
     let mut a = reqwest::get(&url).await.unwrap();
     let mut b = reqwest::get(&url).await.unwrap();
-    assert_eq!(stub_text(&a.chunk().await.unwrap().unwrap()), "X");
-    assert_eq!(stub_text(&b.chunk().await.unwrap().unwrap()), "X");
+    assert_eq!(stub_text(&read_stub_pair(&mut a).await), "X");
+    assert_eq!(stub_text(&read_stub_pair(&mut b).await), "X");
 
     let text = scrape_metrics(addr).await;
     assert_eq!(metric_value(&text, "tvp_stream_slots_in_use"), 2.0);
